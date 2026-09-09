@@ -343,3 +343,34 @@ func (h *Handler) DeleteProxyURL(c *gin.Context) {
 	h.cfg.ProxyURL = ""
 	h.persist(c)
 }
+
+// CodexFingerprintConvergence
+func (h *Handler) GetCodexFingerprintConvergence(c *gin.Context) {
+	value := config.CodexFingerprintConvergenceOff
+	if h.cfg != nil {
+		normalized, ok := config.NormalizeCodexFingerprintConvergence(h.cfg.Codex.FingerprintConvergence)
+		if ok {
+			value = normalized
+		} else {
+			value = strings.TrimSpace(h.cfg.Codex.FingerprintConvergence)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"codex-fingerprint-convergence": value})
+}
+
+func (h *Handler) PutCodexFingerprintConvergence(c *gin.Context) {
+	var body struct {
+		Value *string `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if errValidate := config.ValidateCodexFingerprintConvergence(*body.Value); errValidate != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": errValidate.Error()})
+		return
+	}
+	normalized, _ := config.NormalizeCodexFingerprintConvergence(*body.Value)
+	h.cfg.Codex.FingerprintConvergence = normalized
+	h.persist(c)
+}

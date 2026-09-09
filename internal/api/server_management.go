@@ -44,6 +44,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/debug", s.mgmt.PutDebug)
 		mgmt.PATCH("/debug", s.mgmt.PutDebug)
 
+		mgmt.GET("/codex-fingerprint-convergence", s.mgmt.GetCodexFingerprintConvergence)
+		mgmt.PUT("/codex-fingerprint-convergence", s.mgmt.PutCodexFingerprintConvergence)
+		mgmt.PATCH("/codex-fingerprint-convergence", s.mgmt.PutCodexFingerprintConvergence)
+
 		mgmt.GET("/logging-to-file", s.mgmt.GetLoggingToFile)
 		mgmt.PUT("/logging-to-file", s.mgmt.PutLoggingToFile)
 		mgmt.PATCH("/logging-to-file", s.mgmt.PutLoggingToFile)

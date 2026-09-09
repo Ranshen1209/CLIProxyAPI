@@ -247,8 +247,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
 	var identityState codexIdentityConfuseState
-	// The compact form has no client_metadata, so converge headers only.
-	httpReq, upstreamBody, identityState, err := e.cacheHelperWithConvergence(ctx, from, url, auth, req, originalPayloadSource, body, false, opts.Headers)
+	httpReq, upstreamBody, identityState, err := e.cacheHelperWithConvergence(ctx, from, url, auth, req, originalPayloadSource, body, true, opts.Headers)
 	if err != nil {
 		return resp, err
 	}

@@ -8,34 +8,36 @@ import (
 
 func TestNormalizeCredentialMetadata(t *testing.T) {
 	metadata := map[string]any{
-		"api-key":               "legacy-key",
-		"base-url":              "https://legacy.example",
-		"disable-cooling":       true,
-		"excluded-models":       []any{"legacy-model"},
-		"fingerprint-profile":   "claude-code-cli",
-		"model-aliases":         []any{map[string]any{"name": "upstream", "alias": "public"}},
-		"proxy-url":             "http://legacy-proxy.example",
-		"request-retry":         3,
-		"request_retry":         0,
-		"request-scoped-errors": []any{map[string]any{"status": 429}},
-		"tool-prefix-disabled":  true,
-		"provider_field":        "preserved",
+		"api-key":                 "legacy-key",
+		"base-url":                "https://legacy.example",
+		"disable-cooling":         true,
+		"excluded-models":         []any{"legacy-model"},
+		"fingerprint-convergence": "session",
+		"fingerprint-profile":     "claude-code-cli",
+		"model-aliases":           []any{map[string]any{"name": "upstream", "alias": "public"}},
+		"proxy-url":               "http://legacy-proxy.example",
+		"request-retry":           3,
+		"request_retry":           0,
+		"request-scoped-errors":   []any{map[string]any{"status": 429}},
+		"tool-prefix-disabled":    true,
+		"provider_field":          "preserved",
 	}
 
 	NormalizeCredentialMetadata(metadata)
 
 	want := map[string]any{
-		"api_key":               "legacy-key",
-		"base_url":              "https://legacy.example",
-		"disable_cooling":       true,
-		"excluded_models":       []any{"legacy-model"},
-		"fingerprint_profile":   "claude-code-cli",
-		"model_aliases":         []any{map[string]any{"name": "upstream", "alias": "public"}},
-		"proxy_url":             "http://legacy-proxy.example",
-		"request_retry":         0,
-		"request_scoped_errors": []any{map[string]any{"status": 429}},
-		"tool_prefix_disabled":  true,
-		"provider_field":        "preserved",
+		"api_key":                 "legacy-key",
+		"base_url":                "https://legacy.example",
+		"disable_cooling":         true,
+		"excluded_models":         []any{"legacy-model"},
+		"fingerprint_convergence": "session",
+		"fingerprint_profile":     "claude-code-cli",
+		"model_aliases":           []any{map[string]any{"name": "upstream", "alias": "public"}},
+		"proxy_url":               "http://legacy-proxy.example",
+		"request_retry":           0,
+		"request_scoped_errors":   []any{map[string]any{"status": 429}},
+		"tool_prefix_disabled":    true,
+		"provider_field":          "preserved",
 	}
 	if !reflect.DeepEqual(metadata, want) {
 		t.Fatalf("NormalizeCredentialMetadata() = %#v, want %#v", metadata, want)

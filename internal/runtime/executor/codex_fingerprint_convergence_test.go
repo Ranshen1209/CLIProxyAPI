@@ -1,7 +1,18 @@
 package executor
 
+// Codex fingerprint convergence tests cover:
+//   - UUID derivation (v7 timestamp keep, per-credential installation)
+//   - root vs subagent vs full collapse, cross-request cache affinity
+//   - stripped-header rebuild, HTTP alias drop, websocket underscore contract
+//   - explicit / composite prompt_cache_key, no-evidence and device mode
+//   - root_turn follow, window number, embedded and header turn-metadata
+//   - identity-confuse supersede, auth override, cacheHelper e2e
+//   - F1 cache-key-is-not-session, F2 parent/fork/subagent, compact, WS, HttpRequest
+//   - attribute/metadata overrides, response no-op, non-numeric window
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"testing"
 
@@ -104,8 +115,8 @@ func TestCodexConvergenceRootSessionKeepsSessionEqualsThread(t *testing.T) {
 	if parsed, err := uuid.Parse(state.ids.sessionID); err != nil || parsed.Version() != 7 {
 		t.Fatalf("converged session must stay UUIDv7, got %q (err=%v)", state.ids.sessionID, err)
 	}
-	if state.ids.windowID != state.ids.threadID+":0" {
-		t.Fatalf("window id = %q, want %q", state.ids.windowID, state.ids.threadID+":0")
+	if state.ids.windowID != "" {
+		t.Fatalf("missing window must not be synthesized, got %q", state.ids.windowID)
 	}
 }
 
@@ -117,8 +128,8 @@ func TestCodexConvergenceSubagentThreadStaysDistinct(t *testing.T) {
 	if state.ids.sessionID == state.ids.threadID {
 		t.Fatal("a subagent thread must stay distinct from its root session")
 	}
-	if state.ids.windowID != state.ids.threadID+":0" {
-		t.Fatalf("window id = %q, want %q", state.ids.windowID, state.ids.threadID+":0")
+	if state.ids.windowID != "" {
+		t.Fatalf("missing window must not be synthesized, got %q", state.ids.windowID)
 	}
 }
 
@@ -178,8 +189,8 @@ func TestCodexConvergenceRebuildsStrippedHyphenHeaders(t *testing.T) {
 	if headers.Get("X-Client-Request-Id") != state.ids.threadID {
 		t.Fatalf("X-Client-Request-Id = %q, want %q", headers.Get("X-Client-Request-Id"), state.ids.threadID)
 	}
-	if headers.Get("X-Codex-Window-Id") != state.ids.threadID+":0" {
-		t.Fatalf("X-Codex-Window-Id = %q, want %q", headers.Get("X-Codex-Window-Id"), state.ids.threadID+":0")
+	if headers.Get("X-Codex-Window-Id") != "" {
+		t.Fatalf("X-Codex-Window-Id = %q, want omitted when the client sent none", headers.Get("X-Codex-Window-Id"))
 	}
 }
 
@@ -240,13 +251,19 @@ func TestCodexConvergenceExplicitPromptCacheKeyIsPreserved(t *testing.T) {
 	}
 }
 
-func TestCodexConvergenceCompositePromptCacheKeyIsPreserved(t *testing.T) {
+func TestCodexConvergenceCompositePromptCacheKeyDerivesThreadPart(t *testing.T) {
 	raw := uuid.Must(uuid.NewV7()).String()
-	composite := "spawn:" + uuid.Must(uuid.NewV7()).String()
+	parent := uuid.Must(uuid.NewV7()).String()
+	composite := "spawn:" + parent
 	body := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"` + composite + `","client_metadata":{"session_id":"` + raw + `"}}`)
 	state := resolveConvergenceForTest(t, "session", convergenceTestAuth("account-a"), http.Header{}, body)
-	if state.ids.promptCacheKey != "" {
-		t.Fatalf("composite subagent prompt_cache_key must not be converged, got %q", state.ids.promptCacheKey)
+	want := "spawn:" + codexConvergenceDeriveUUID("account:account-a", "thread", parent)
+	if state.ids.promptCacheKey != want {
+		t.Fatalf("composite prompt_cache_key = %q, want %q", state.ids.promptCacheKey, want)
+	}
+	out := applyConvergenceForTest(t, body, state)
+	if got := gjson.GetBytes(out, "prompt_cache_key").String(); got != want {
+		t.Fatalf("body prompt_cache_key = %q, want %q", got, want)
 	}
 }
 
@@ -431,5 +448,242 @@ func TestCodexCacheHelperAppliesConvergenceToBodyAndHeaders(t *testing.T) {
 	}
 	if got := httpReq.Header.Get("X-Codex-Installation-Id"); got != state.convergence.ids.installationID {
 		t.Fatalf("X-Codex-Installation-Id = %q, want %q", got, state.convergence.ids.installationID)
+	}
+}
+
+func TestCodexConvergenceExplicitCacheKeyWithoutSessionIsNotStaged(t *testing.T) {
+	key := "explicit-shared-bucket"
+	body := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"` + key + `","input":[]}`)
+	state := resolveCodexFingerprintConvergence(convergenceTestConfig("session"), convergenceTestAuth("account-a"),
+		http.Header{}, body, body, key, codexConvergenceHeadersHyphen)
+	if state.ids.sessionID != "" || state.convergesSession() {
+		t.Fatalf("explicit cache key must not become a session, got %q", state.ids.sessionID)
+	}
+	out := applyConvergenceForTest(t, body, state)
+	if got := gjson.GetBytes(out, "prompt_cache_key").String(); got != key {
+		t.Fatalf("prompt_cache_key = %q, want preserved %q", got, key)
+	}
+	if gjson.GetBytes(out, "client_metadata.session_id").Exists() {
+		t.Fatalf("body gained a session_id: %s", out)
+	}
+}
+
+func TestCodexConvergenceGatewayCacheIDWithoutClientKeyIsSessionEvidence(t *testing.T) {
+	gatewayID := uuid.Must(uuid.NewV7()).String()
+	body := []byte(`{"model":"gpt-5-codex","input":[]}`)
+	state := resolveCodexFingerprintConvergence(convergenceTestConfig("session"), convergenceTestAuth("account-a"),
+		http.Header{}, body, body, gatewayID, codexConvergenceHeadersHyphen)
+	if !state.convergesSession() {
+		t.Fatal("gateway-invented cacheID should be adopted as session evidence")
+	}
+	if state.ids.sessionID == gatewayID {
+		t.Fatal("adopted cacheID must still be derived")
+	}
+}
+
+func TestCodexConvergenceParentTurnForkAndSubagentSync(t *testing.T) {
+	session := uuid.Must(uuid.NewV7()).String()
+	parentTurn := uuid.Must(uuid.NewV7()).String()
+	forked := uuid.Must(uuid.NewV7()).String()
+	body := []byte(`{"model":"gpt-5-codex","client_metadata":{"session_id":"` + session + `","thread_id":"` + session + `","parent_turn_id":"` + parentTurn + `","forked_from_thread_id":"` + forked + `","x-openai-subagent":"COLLAB_SPAWN"}}`)
+	state := resolveConvergenceForTest(t, "session", convergenceTestAuth("account-a"), http.Header{}, body)
+	if state.ids.parentTurnID == "" || state.ids.parentTurnID == parentTurn {
+		t.Fatalf("parent_turn_id must be derived, got %q", state.ids.parentTurnID)
+	}
+	if state.ids.forkedFromThreadID == "" || state.ids.forkedFromThreadID == forked {
+		t.Fatalf("forked_from_thread_id must be derived, got %q", state.ids.forkedFromThreadID)
+	}
+	if state.ids.subagent != "COLLAB_SPAWN" {
+		t.Fatalf("subagent = %q, want COLLAB_SPAWN", state.ids.subagent)
+	}
+	out := applyConvergenceForTest(t, body, state)
+	if got := gjson.GetBytes(out, "client_metadata.parent_turn_id").String(); got != state.ids.parentTurnID {
+		t.Fatalf("body parent_turn_id = %q, want %q", got, state.ids.parentTurnID)
+	}
+	if got := gjson.GetBytes(out, "client_metadata.forked_from_thread_id").String(); got != state.ids.forkedFromThreadID {
+		t.Fatalf("body forked_from_thread_id = %q, want %q", got, state.ids.forkedFromThreadID)
+	}
+	headers := http.Header{}
+	applyCodexFingerprintConvergenceHeaders(headers, state)
+	if headers.Get("X-Openai-Subagent") != "COLLAB_SPAWN" {
+		t.Fatalf("subagent header = %q, want COLLAB_SPAWN", headers.Get("X-Openai-Subagent"))
+	}
+}
+
+func TestCodexConvergenceDoesNotInjectTurnStartedAt(t *testing.T) {
+	raw := uuid.Must(uuid.NewV7()).String()
+	headers := http.Header{}
+	headers.Set("Session-Id", raw)
+	headers.Set("Thread-Id", raw)
+	headers.Set("X-Codex-Turn-Metadata", `{"session_id":"`+raw+`","turn_started_at_unix_ms":123}`)
+	state := resolveConvergenceForTest(t, "session", convergenceTestAuth("account-a"), headers, nil)
+	out := http.Header{}
+	applyCodexFingerprintConvergenceHeaders(out, state)
+	got := out.Get("X-Codex-Turn-Metadata")
+	if gjson.Get(got, "turn_started_at_unix_ms").Int() != 123 {
+		t.Fatalf("turn_started_at_unix_ms = %s, want original 123", gjson.Get(got, "turn_started_at_unix_ms").Raw)
+	}
+}
+
+func TestCodexConvergenceWindowNumberNonNumericIsNotSynthesized(t *testing.T) {
+	raw := uuid.Must(uuid.NewV7()).String()
+	body := []byte(`{"model":"gpt-5-codex","client_metadata":{"session_id":"` + raw + `","thread_id":"` + raw + `","x-codex-window-id":"not-a-window"}}`)
+	state := resolveConvergenceForTest(t, "session", convergenceTestAuth("account-a"), http.Header{}, body)
+	if state.ids.windowID != "" {
+		t.Fatalf("non-numeric window must not be synthesized, got %q", state.ids.windowID)
+	}
+	out := applyConvergenceForTest(t, body, state)
+	if gjson.GetBytes(out, "client_metadata.x-codex-window-id").String() == state.ids.threadID+":0" {
+		t.Fatal("body invented a :0 window")
+	}
+}
+
+func TestCodexConvergenceDeviceModeRewritesEmbeddedInstallationOnly(t *testing.T) {
+	raw := uuid.Must(uuid.NewV7()).String()
+	embedded := `{\"session_id\":\"` + raw + `\",\"installation_id\":\"client-install\"}`
+	body := []byte(`{"model":"gpt-5-codex","client_metadata":{"session_id":"` + raw + `","x-codex-turn-metadata":"` + embedded + `"}}`)
+	state := resolveConvergenceForTest(t, "device", convergenceTestAuth("account-a"), http.Header{}, body)
+	out := applyConvergenceForTest(t, body, state)
+	if got := gjson.GetBytes(out, "client_metadata.session_id").String(); got != raw {
+		t.Fatalf("device mode session_id = %q, want %q", got, raw)
+	}
+	gotEmbedded := gjson.GetBytes(out, "client_metadata.x-codex-turn-metadata").String()
+	if got := gjson.Get(gotEmbedded, "session_id").String(); got != raw {
+		t.Fatalf("embedded session_id = %q, want untouched", got)
+	}
+	if got := gjson.Get(gotEmbedded, "installation_id").String(); got != state.ids.installationID {
+		t.Fatalf("embedded installation_id = %q, want %q", got, state.ids.installationID)
+	}
+}
+
+func TestCodexConvergenceAuthAttributeAndFalseOverrides(t *testing.T) {
+	raw := uuid.Must(uuid.NewV7()).String()
+	headers := http.Header{"Session-Id": {raw}, "Thread-Id": {raw}}
+
+	hyphen := convergenceTestAuth("account-a")
+	hyphen.Attributes = map[string]string{codexConvergenceModeAttrLegacy: "session"}
+	state := resolveConvergenceForTest(t, "off", hyphen, headers, nil)
+	if state.mode != codexConvergenceSession {
+		t.Fatalf("hyphen attribute mode = %q, want session", state.mode)
+	}
+
+	booleanOff := convergenceTestAuth("account-b")
+	booleanOff.Metadata[codexConvergenceModeAttr] = false
+	state = resolveConvergenceForTest(t, "session", booleanOff, headers, nil)
+	if state.mode != codexConvergenceOff {
+		t.Fatalf("boolean false override mode = %q, want off", state.mode)
+	}
+
+	floatOff := convergenceTestAuth("account-c")
+	floatOff.Metadata[codexConvergenceModeAttr] = float64(0)
+	state = resolveConvergenceForTest(t, "session", floatOff, headers, nil)
+	if state.mode != codexConvergenceOff {
+		t.Fatalf("float64 0 override mode = %q, want off", state.mode)
+	}
+}
+
+func TestCodexConvergenceDoesNotRewriteResponsePayload(t *testing.T) {
+	raw := uuid.Must(uuid.NewV7()).String()
+	body := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"` + raw + `","client_metadata":{"session_id":"` + raw + `"}}`)
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true, FingerprintConvergence: "session"},
+	}
+	auth := convergenceTestAuth("account-a")
+	_, state := applyCodexIdentityConfuseBody(cfg, auth, body, body)
+	payload := []byte(`{"prompt_cache_key":"` + raw + `","session_id":"` + raw + `"}`)
+	if got := applyCodexIdentityConfuseResponsePayload(payload, state); string(got) != string(payload) {
+		t.Fatalf("response payload changed while convergence supersedes confuse: %s", got)
+	}
+}
+
+func TestCodexConvergenceCompactRewritesExistingPromptCacheKeyOnly(t *testing.T) {
+	raw := uuid.Must(uuid.NewV7()).String()
+	executor := &CodexExecutor{cfg: convergenceTestConfig("session")}
+	auth := convergenceTestAuth("account-a")
+	payload := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"` + raw + `"}`)
+	clientHeaders := http.Header{"Session-Id": {raw}, "Thread-Id": {raw}}
+	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: payload}
+	_, body, state, err := executor.cacheHelperWithConvergence(context.Background(), sdktranslator.FromString("openai-response"),
+		"https://example.com/responses/compact", auth, req, payload, payload, true, clientHeaders)
+	if err != nil {
+		t.Fatalf("cacheHelperWithConvergence error: %v", err)
+	}
+	if !gjson.GetBytes(body, "client_metadata.session_id").Exists() && !gjson.GetBytes(payload, "client_metadata").Exists() {
+		// compact must not invent client_metadata
+	} else if gjson.GetBytes(payload, "client_metadata").Exists() {
+		t.Fatal("fixture unexpectedly had client_metadata")
+	}
+	if gjson.GetBytes(body, "client_metadata").Exists() {
+		t.Fatalf("compact invented client_metadata: %s", body)
+	}
+	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != state.convergence.ids.sessionID {
+		t.Fatalf("compact prompt_cache_key = %q, want %q", got, state.convergence.ids.sessionID)
+	}
+}
+
+func TestCodexConvergenceWebsocketExecuteF1AndUnderscore(t *testing.T) {
+	key := "explicit-shared-bucket"
+	body := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"` + key + `"}`)
+	headers := http.Header{"session_id": {""}}
+	state := resolveCodexFingerprintConvergence(convergenceTestConfig("session"), convergenceTestAuth("account-a"),
+		headers, body, body, key, codexConvergenceHeadersUnderscore)
+	if state.convergesSession() {
+		t.Fatal("WS must not stage an explicit cache key as a session")
+	}
+	raw := uuid.Must(uuid.NewV7()).String()
+	wsHeaders := http.Header{"session_id": {raw}, "Conversation_id": {raw}, "Session-Id": {raw}}
+	withSession := resolveCodexFingerprintConvergence(convergenceTestConfig("session"), convergenceTestAuth("account-a"),
+		wsHeaders, nil, nil, "", codexConvergenceHeadersUnderscore)
+	out := wsHeaders.Clone()
+	applyCodexFingerprintConvergenceHeaders(out, withSession)
+	if out.Get("Session-Id") != "" {
+		t.Fatalf("hyphen Session-Id leaked on websocket: %q", out.Get("Session-Id"))
+	}
+	if got := out["session_id"]; len(got) == 0 || got[0] != withSession.ids.sessionID {
+		t.Fatalf("session_id = %#v, want [%q]", out["session_id"], withSession.ids.sessionID)
+	}
+}
+
+func TestCodexConvergenceHTTPRequestJSONPath(t *testing.T) {
+	raw := uuid.Must(uuid.NewV7()).String()
+	payload := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"` + raw + `","client_metadata":{"session_id":"` + raw + `","thread_id":"` + raw + `"}}`)
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/live", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Session-Id", raw)
+	req.Header.Set("Thread-Id", raw)
+	out, errApply := applyCodexFingerprintConvergenceHTTPRequest(convergenceTestConfig("session"), convergenceTestAuth("account-a"), req)
+	if errApply != nil {
+		t.Fatalf("applyCodexFingerprintConvergenceHTTPRequest: %v", errApply)
+	}
+	body, errRead := io.ReadAll(out.Body)
+	if errRead != nil {
+		t.Fatalf("read body: %v", errRead)
+	}
+	if got := gjson.GetBytes(body, "client_metadata.session_id").String(); got == raw || got == "" {
+		t.Fatalf("live JSON session was not converged: %q", got)
+	}
+	if out.Header.Get("Session-Id") == raw {
+		t.Fatal("Session-Id was not converged")
+	}
+}
+
+func TestCodexConvergenceHTTPRequestSkipsNonJSON(t *testing.T) {
+	sdp := []byte("v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n")
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/live", bytes.NewReader(sdp))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/sdp")
+	out, errApply := applyCodexFingerprintConvergenceHTTPRequest(convergenceTestConfig("session"), convergenceTestAuth("account-a"), req)
+	if errApply != nil {
+		t.Fatalf("apply: %v", errApply)
+	}
+	body, _ := io.ReadAll(out.Body)
+	if string(body) != string(sdp) {
+		t.Fatalf("SDP body changed: %q", body)
 	}
 }

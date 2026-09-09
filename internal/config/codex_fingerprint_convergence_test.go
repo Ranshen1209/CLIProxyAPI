@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestNormalizeCodexFingerprintConvergence(t *testing.T) {
 	cases := []struct {
@@ -37,8 +42,8 @@ func TestSanitizeCodexFingerprintConvergence(t *testing.T) {
 		t.Fatalf("recognized value = %q, want %q", got, CodexFingerprintConvergenceSession)
 	}
 
-	// An unrecognized value is preserved so sanitizing never destroys operator
-	// input; the request path falls back to off and warns once.
+	// An unrecognized value is trimmed and kept so ValidateCodexFingerprintConvergence
+	// can fail load/parse with the operator's original token.
 	cfg = &Config{Codex: CodexConfig{FingerprintConvergence: " bogus "}}
 	cfg.SanitizeCodexFingerprintConvergence()
 	if got := cfg.Codex.FingerprintConvergence; got != "bogus" {
@@ -54,5 +59,40 @@ func TestValidateCodexFingerprintConvergence(t *testing.T) {
 	}
 	if err := ValidateCodexFingerprintConvergence("bogus"); err == nil {
 		t.Fatal("ValidateCodexFingerprintConvergence(bogus) = nil, want error")
+	}
+}
+
+func TestLoadConfigOptionalRejectsBogusFingerprintConvergence(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("codex:\n  fingerprint-convergence: bogus\n"), 0o600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+	_, err := LoadConfigOptional(configPath, false)
+	if err == nil {
+		t.Fatal("LoadConfigOptional() error = nil, want unrecognized fingerprint-convergence")
+	}
+	if !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("LoadConfigOptional() error = %v, want it to mention bogus", err)
+	}
+}
+
+func TestParseConfigBytesRejectsBogusFingerprintConvergence(t *testing.T) {
+	_, err := ParseConfigBytes([]byte("codex:\n  fingerprint-convergence: bogus\n"))
+	if err == nil {
+		t.Fatal("ParseConfigBytes() error = nil, want unrecognized fingerprint-convergence")
+	}
+	if !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("ParseConfigBytes() error = %v, want it to mention bogus", err)
+	}
+}
+
+func TestParseConfigBytesAcceptsFingerprintConvergenceSession(t *testing.T) {
+	cfg, err := ParseConfigBytes([]byte("codex:\n  fingerprint-convergence: Session\n"))
+	if err != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", err)
+	}
+	if got := cfg.Codex.FingerprintConvergence; got != CodexFingerprintConvergenceSession {
+		t.Fatalf("FingerprintConvergence = %q, want %q", got, CodexFingerprintConvergenceSession)
 	}
 }

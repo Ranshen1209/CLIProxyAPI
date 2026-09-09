@@ -370,6 +370,63 @@ func TestPatchAuthFileFields_RejectsInvalidWeights(t *testing.T) {
 	}
 }
 
+func TestPatchAuthFileFields_RejectsInvalidFingerprintConvergence(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{ID: "auth.json", FileName: "auth.json", Provider: "codex", Metadata: map[string]any{"type": "codex"}}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+
+	for _, body := range []string{
+		`{"name":"auth.json","fingerprint_convergence":"bogus"}`,
+		`{"name":"auth.json","fingerprint-convergence":"sessions"}`,
+	} {
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		h.PatchAuthFileFields(ctx)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("body %s status = %d, want 422; body=%s", body, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestPatchAuthFileFields_FingerprintConvergenceHyphenAlias(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{ID: "auth.json", FileName: "auth.json", Provider: "codex", Metadata: map[string]any{"type": "codex"}}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	body := `{"name":"auth.json","fingerprint-convergence":" Session "}`
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	h.PatchAuthFileFields(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	updated, ok := manager.GetByID("auth.json")
+	if !ok || updated == nil {
+		t.Fatal("expected auth record after patch")
+	}
+	if got, _ := updated.Metadata[coreauth.AttributeFingerprintConvergence].(string); got != config.CodexFingerprintConvergenceSession {
+		t.Fatalf("metadata fingerprint_convergence = %#v, want %q", updated.Metadata[coreauth.AttributeFingerprintConvergence], config.CodexFingerprintConvergenceSession)
+	}
+	if _, exists := updated.Metadata["fingerprint-convergence"]; exists {
+		t.Fatalf("legacy hyphen key retained: %#v", updated.Metadata)
+	}
+	if got := updated.Attributes[coreauth.AttributeFingerprintConvergence]; got != config.CodexFingerprintConvergenceSession {
+		t.Fatalf("attribute fingerprint_convergence = %q, want %q", got, config.CodexFingerprintConvergenceSession)
+	}
+}
+
 func TestPatchAuthFileFields_RequestRetryRoundTrip(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 

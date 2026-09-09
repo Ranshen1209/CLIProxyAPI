@@ -2,12 +2,10 @@ package executor
 
 import (
 	"crypto/sha256"
-	"encoding/json"
 	"net/http"
 	"regexp"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -18,6 +16,10 @@ import (
 )
 
 // Codex fingerprint convergence.
+//
+// This file stays in package executor next to identity-confuse (codex_executor_request.go)
+// because both share unexported request-path types. Moving it to helps/ would export
+// that snapshot or split one rewrite across packages.
 //
 // A single Codex OAuth credential is often shared by many downstream users. Each
 // real Codex client reports its own installation/session/thread/turn/window IDs,
@@ -32,14 +34,17 @@ import (
 //     because both are derived with the same namespace.
 //   - session/thread/turn/window/context-window UUIDv7 values keep their millisecond
 //     timestamp prefix and version 7; everything else derives a UUIDv4.
-//   - x-codex-window-id keeps the "<thread>:<window_number>" form.
-//   - root_turn_id follows turn_id for a root turn and stays distinct for a child.
+//   - x-codex-window-id keeps the "<thread>:<window_number>" form when the client
+//     sent a numeric window; missing or non-numeric windows are not invented.
+//   - root_turn_id follows turn_id for a root turn and stays distinct for a child,
+//     and is only written when the client sent one.
 //   - the underscore session_id / conversation_id aliases are dropped on HTTP once a
 //     hyphen session-id exists.
 //
 // Cache correctness is the primary constraint: every derived value is a pure
 // function of the credential seed plus the client's raw identifier, so the same
 // client session always produces the same upstream session and prompt cache key.
+// A prompt_cache_key alone is not session evidence and is never staged as one.
 // When no client session evidence exists at all, session identity is left untouched
 // so a request can never leave the gateway with a freshly invented, cache-busting
 // session; only the per-credential installation ID is converged.
@@ -52,6 +57,8 @@ const (
 	// send lower-case.
 	codexTurnMetadataHeader   = "X-Codex-Turn-Metadata"
 	codexTurnMetadataBodyKey  = "x-codex-turn-metadata"
+	codexSubagentHeader       = "X-Openai-Subagent"
+	codexSubagentBodyKey      = "x-openai-subagent"
 	codexConvergenceNamespace = "cli-proxy-api:codex:fingerprint-convergence:v1"
 )
 
@@ -190,13 +197,16 @@ func codexConvergenceDeriveUUID(seed, kind, raw string) string {
 // codexConvergenceRawIdentity is the client-supplied identity captured before any
 // rewrite. Header evidence wins over body evidence for the same field.
 type codexConvergenceRawIdentity struct {
-	sessionID       string
-	threadID        string
-	turnID          string
-	rootTurnID      string
-	windowID        string
-	contextWindowID string
-	parentThreadID  string
+	sessionID          string
+	threadID           string
+	turnID             string
+	rootTurnID         string
+	windowID           string
+	contextWindowID    string
+	parentThreadID     string
+	parentTurnID       string
+	forkedFromThreadID string
+	subagent           string
 }
 
 func (raw codexConvergenceRawIdentity) hasSessionEvidence() bool {
@@ -205,16 +215,18 @@ func (raw codexConvergenceRawIdentity) hasSessionEvidence() bool {
 
 // codexConvergenceIdentity is the converged identity projected onto every carrier.
 type codexConvergenceIdentity struct {
-	installationID  string
-	sessionID       string
-	threadID        string
-	turnID          string
-	rootTurnID      string
-	windowID        string
-	parentThreadID  string
-	contextWindowID string
-	promptCacheKey  string
-	turnStartedAtMs int64
+	installationID     string
+	sessionID          string
+	threadID           string
+	turnID             string
+	rootTurnID         string
+	windowID           string
+	parentThreadID     string
+	parentTurnID       string
+	forkedFromThreadID string
+	contextWindowID    string
+	promptCacheKey     string
+	subagent           string
 }
 
 // codexFingerprintConvergenceState carries the resolved identity between the body
@@ -244,7 +256,8 @@ func codexConvergenceModeEnabled(cfg *config.Config, auth *cliproxyauth.Auth) bo
 
 // resolveCodexFingerprintConvergence captures client evidence and derives the
 // converged identity. cacheID is the prompt cache key the gateway itself assigned
-// (empty when it did not), used only to recognise a gateway-invented cache key.
+// (empty when it did not). A cache ID that is only the client's prompt_cache_key
+// is not independent session evidence and is never staged as a session.
 func resolveCodexFingerprintConvergence(
 	cfg *config.Config,
 	auth *cliproxyauth.Auth,
@@ -254,8 +267,8 @@ func resolveCodexFingerprintConvergence(
 	cacheID string,
 	sessionHeaderStyle codexConvergenceSessionHeaderStyle,
 ) codexFingerprintConvergenceState {
-	state := codexFingerprintConvergenceState{sessionHeaderStyle: sessionHeaderStyle}
 	mode := resolveCodexFingerprintConvergenceMode(cfg, auth)
+	state := codexFingerprintConvergenceState{mode: mode, sessionHeaderStyle: sessionHeaderStyle}
 	if mode == codexConvergenceOff {
 		return state
 	}
@@ -266,18 +279,20 @@ func resolveCodexFingerprintConvergence(
 
 	raw := captureCodexConvergenceRawIdentity(clientHeaders, upstreamBody)
 	clientPromptCacheKey := strings.TrimSpace(gjson.GetBytes(clientBody, "prompt_cache_key").String())
+	cacheID = strings.TrimSpace(cacheID)
 	// The gateway's own prompt cache key is a stable per-conversation identity
 	// (session affinity, Claude Code session, or a derived session UUID). When the
 	// client sent no session header or body session at all it is the only session
 	// evidence available, and adopting it keeps session_id == prompt_cache_key
-	// without inventing a value that changes between requests.
-	if !raw.hasSessionEvidence() && strings.TrimSpace(cacheID) != "" {
-		raw.sessionID = strings.TrimSpace(cacheID)
+	// without inventing a value that changes between requests. A client-supplied
+	// cache key by itself is not a session and must not be staged as one.
+	if !raw.hasSessionEvidence() && cacheID != "" && !codexConvergenceCacheIDIsClientKey(cacheID, clientPromptCacheKey) {
+		raw.sessionID = cacheID
 	}
 
 	ids := codexConvergenceIdentity{
-		installationID:  codexConvergenceDeriveUUID(seed, "installation", seed),
-		turnStartedAtMs: time.Now().UnixMilli(),
+		installationID: codexConvergenceDeriveUUID(seed, "installation", seed),
+		subagent:       raw.subagent,
 	}
 
 	if mode != codexConvergenceDevice && raw.hasSessionEvidence() {
@@ -294,19 +309,36 @@ func resolveCodexFingerprintConvergence(
 		if mode == codexConvergenceFull {
 			ids.threadID = ids.sessionID
 		}
-		ids.turnID = uuid.Must(uuid.NewV7()).String()
-		ids.rootTurnID = ids.turnID
-		if raw.rootTurnID != "" && raw.turnID != "" && raw.rootTurnID != raw.turnID {
-			ids.rootTurnID = codexConvergenceDeriveUUID(seed, "turn", raw.rootTurnID)
+		if turn, errTurn := uuid.NewV7(); errTurn == nil {
+			ids.turnID = turn.String()
+		} else if raw.turnID != "" {
+			ids.turnID = raw.turnID
 		}
-		ids.windowID = ids.threadID + ":" + codexConvergenceWindowNumber(raw.windowID)
+		if raw.rootTurnID != "" {
+			if raw.turnID != "" && raw.rootTurnID == raw.turnID && ids.turnID != "" {
+				ids.rootTurnID = ids.turnID
+			} else {
+				ids.rootTurnID = codexConvergenceDeriveUUID(seed, "turn", raw.rootTurnID)
+			}
+		}
+		if number, ok := codexConvergenceWindowNumber(raw.windowID); ok {
+			ids.windowID = ids.threadID + ":" + number
+		}
 		if raw.parentThreadID != "" {
 			ids.parentThreadID = codexConvergenceDeriveUUID(seed, "thread", raw.parentThreadID)
+		}
+		if raw.parentTurnID != "" {
+			ids.parentTurnID = codexConvergenceDeriveUUID(seed, "turn", raw.parentTurnID)
+		}
+		if raw.forkedFromThreadID != "" {
+			ids.forkedFromThreadID = codexConvergenceDeriveUUID(seed, "thread", raw.forkedFromThreadID)
 		}
 		if raw.contextWindowID != "" {
 			ids.contextWindowID = codexConvergenceDeriveUUID(seed, "context-window", raw.contextWindowID)
 		}
-		if codexConvergenceShouldRewritePromptCacheKey(raw, clientPromptCacheKey, cacheID) {
+		if composite := deriveCodexConvergenceCompositePromptCacheKey(seed, clientPromptCacheKey); composite != "" {
+			ids.promptCacheKey = composite
+		} else if codexConvergenceShouldRewritePromptCacheKey(raw, clientPromptCacheKey, cacheID) {
 			ids.promptCacheKey = ids.sessionID
 		}
 	}
@@ -316,6 +348,12 @@ func resolveCodexFingerprintConvergence(
 	state.ids = ids
 	state.rawTurnMetadata = codexConvergenceTurnMetadataSource(clientHeaders, upstreamBody)
 	return state
+}
+
+func codexConvergenceCacheIDIsClientKey(cacheID, clientPromptCacheKey string) bool {
+	cacheID = strings.TrimSpace(cacheID)
+	clientPromptCacheKey = strings.TrimSpace(clientPromptCacheKey)
+	return cacheID != "" && clientPromptCacheKey != "" && cacheID == clientPromptCacheKey
 }
 
 // captureCodexConvergenceRawIdentity reads the client identity from the inbound
@@ -330,6 +368,7 @@ func captureCodexConvergenceRawIdentity(clientHeaders http.Header, body []byte) 
 		fillCodexConvergenceRawString(&raw.threadID, clientHeaders.Get("thread_id"))
 		fillCodexConvergenceRawString(&raw.windowID, clientHeaders.Get("x-codex-window-id"))
 		fillCodexConvergenceRawString(&raw.parentThreadID, clientHeaders.Get("x-codex-parent-thread-id"))
+		fillCodexConvergenceRawString(&raw.subagent, clientHeaders.Get(codexSubagentHeader))
 		captureCodexConvergenceRawFromResult(&raw, gjson.Parse(strings.TrimSpace(clientHeaders.Get(codexTurnMetadataHeader))))
 	}
 	if len(body) == 0 {
@@ -363,6 +402,9 @@ func captureCodexConvergenceRawFromResult(raw *codexConvergenceRawIdentity, meta
 	fillCodexConvergenceRawString(&raw.contextWindowID, codexConvergenceMetadataString(metadata, "context_window_id"))
 	fillCodexConvergenceRawString(&raw.parentThreadID, codexConvergenceMetadataString(metadata, "parent_thread_id"))
 	fillCodexConvergenceRawString(&raw.parentThreadID, codexConvergenceMetadataString(metadata, "x-codex-parent-thread-id"))
+	fillCodexConvergenceRawString(&raw.parentTurnID, codexConvergenceMetadataString(metadata, "parent_turn_id"))
+	fillCodexConvergenceRawString(&raw.forkedFromThreadID, codexConvergenceMetadataString(metadata, "forked_from_thread_id"))
+	fillCodexConvergenceRawString(&raw.subagent, codexConvergenceMetadataString(metadata, codexSubagentBodyKey))
 }
 
 func codexConvergenceMetadataString(metadata gjson.Result, name string) string {
@@ -398,35 +440,42 @@ func codexConvergenceTurnMetadataSource(clientHeaders http.Header, body []byte) 
 	return strings.TrimSpace(embedded.String())
 }
 
-func codexConvergenceWindowNumber(raw string) string {
+func codexConvergenceWindowNumber(raw string) (string, bool) {
 	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
 	if idx := strings.LastIndex(raw, ":"); idx > 0 {
 		if number := strings.TrimSpace(raw[idx+1:]); number != "" {
-			digits := true
 			for _, char := range number {
 				if char < '0' || char > '9' {
-					digits = false
-					break
+					return "", false
 				}
 			}
-			if digits {
-				return number
-			}
+			return number, true
 		}
 	}
-	return "0"
+	return "", false
 }
 
 // codexConvergencePromptCacheKeyPattern matches the subagent cache key form
-// "<session_source>:<parent_thread_id>", which must never be collapsed onto the
-// converged session or the parent-thread relationship disappears.
+// "<session_source>:<parent_thread_id>". The UUID part is derived; the prefix is kept.
 var codexConvergencePromptCacheKeyPattern = regexp.MustCompile(
-	`^[A-Za-z0-9_-]{1,64}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	`^([A-Za-z0-9_-]{1,64}):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
+
+func deriveCodexConvergenceCompositePromptCacheKey(seed, clientPromptCacheKey string) string {
+	clientPromptCacheKey = strings.TrimSpace(clientPromptCacheKey)
+	matches := codexConvergencePromptCacheKeyPattern.FindStringSubmatch(clientPromptCacheKey)
+	if len(matches) != 3 {
+		return ""
+	}
+	return matches[1] + ":" + codexConvergenceDeriveUUID(seed, "thread", matches[2])
+}
 
 // codexConvergenceShouldRewritePromptCacheKey decides whether the prompt cache key
 // is a session-scoped default that may follow the converged session. An explicit
 // client key is never touched, so a caller that deliberately shares or splits a
-// cache bucket keeps that behavior.
+// cache bucket keeps that behavior. Composite keys are handled separately.
 func codexConvergenceShouldRewritePromptCacheKey(raw codexConvergenceRawIdentity, clientPromptCacheKey string, cacheID string) bool {
 	clientPromptCacheKey = strings.TrimSpace(clientPromptCacheKey)
 	if codexConvergencePromptCacheKeyPattern.MatchString(clientPromptCacheKey) {
@@ -434,7 +483,9 @@ func codexConvergenceShouldRewritePromptCacheKey(raw codexConvergenceRawIdentity
 	}
 	if clientPromptCacheKey == "" {
 		// No client-supplied key: the upstream body carries either the gateway's
-		// own session-derived key or nothing, both safe to align with the session.
+		// own session-derived key or nothing. Align with the session only when the
+		// body already has a prompt_cache_key (rewriteCodexConvergenceExistingPromptCacheKey
+		// refuses to invent the field).
 		return true
 	}
 	if raw.sessionID != "" && clientPromptCacheKey == raw.sessionID {
@@ -443,15 +494,15 @@ func codexConvergenceShouldRewritePromptCacheKey(raw codexConvergenceRawIdentity
 	if raw.threadID != "" && clientPromptCacheKey == raw.threadID {
 		return true
 	}
-	if cacheID != "" && clientPromptCacheKey == cacheID {
+	if cacheID != "" && clientPromptCacheKey == cacheID && raw.hasSessionEvidence() {
 		return true
 	}
 	return false
 }
 
-// applyCodexFingerprintConvergenceBody rewrites the upstream request body. It is
-// skipped for the compact form, which has no client_metadata by design; the header
-// rewrite still runs there so the outbound device identity stays converged.
+// applyCodexFingerprintConvergenceBody rewrites the upstream request body.
+// Non-Responses bodies never gain client_metadata. prompt_cache_key is rewritten
+// only when the field already exists.
 func applyCodexFingerprintConvergenceBody(body []byte, state codexFingerprintConvergenceState) ([]byte, bool) {
 	if len(body) == 0 || !state.active() {
 		return body, false
@@ -463,96 +514,84 @@ func applyCodexFingerprintConvergenceBody(body []byte, state codexFingerprintCon
 
 	existing := root.Get("client_metadata")
 	hasClientMetadata := existing.IsObject()
-	// Only Responses-shaped bodies carry client_metadata. Mutating a non-Responses
-	// body (for example a direct image endpoint) would invent a field the upstream
-	// schema does not expect, so those requests converge headers only.
-	if !hasClientMetadata && !root.Get("input").Exists() && !root.Get("instructions").Exists() {
-		if state.ids.promptCacheKey == "" {
-			return body, false
-		}
-		return setCodexConvergencePromptCacheKey(body, state.ids.promptCacheKey)
-	}
-
-	clientMetadata := map[string]any{}
-	if hasClientMetadata {
-		if err := json.Unmarshal([]byte(existing.Raw), &clientMetadata); err != nil {
-			return body, false
-		}
-	}
-
-	changed := false
-	if state.ids.installationID != "" {
-		clientMetadata["x-codex-installation-id"] = state.ids.installationID
-		changed = true
-	}
-	if state.convergesSession() {
-		clientMetadata["session_id"] = state.ids.sessionID
-		clientMetadata["thread_id"] = state.ids.threadID
-		clientMetadata["turn_id"] = state.ids.turnID
-		if state.ids.rootTurnID != "" {
-			clientMetadata["root_turn_id"] = state.ids.rootTurnID
-		}
-		clientMetadata["x-codex-window-id"] = state.ids.windowID
-		if state.ids.parentThreadID != "" {
-			clientMetadata["x-codex-parent-thread-id"] = state.ids.parentThreadID
-		}
-		if state.ids.contextWindowID != "" {
-			clientMetadata["context_window_id"] = state.ids.contextWindowID
-		}
-		rewriteCodexConvergenceEmbeddedMetadata(clientMetadata, state)
-		changed = true
-	} else if state.mode == codexConvergenceDevice {
-		rewriteCodexConvergenceEmbeddedMetadata(clientMetadata, state)
-		changed = true
+	isResponses := hasClientMetadata || root.Get("input").Exists() || root.Get("instructions").Exists()
+	if !isResponses {
+		return rewriteCodexConvergenceExistingPromptCacheKey(body, state)
 	}
 
 	next := body
-	if changed {
-		encoded, errMarshal := json.Marshal(clientMetadata)
-		if errMarshal != nil {
-			return body, false
-		}
-		updated, errSet := sjson.SetRawBytes(next, "client_metadata", encoded)
-		if errSet != nil {
-			return body, false
-		}
-		next = updated
-	}
-	if state.ids.promptCacheKey != "" {
-		if updated, updatedOK := setCodexConvergencePromptCacheKey(next, state.ids.promptCacheKey); updatedOK {
+	changed := false
+	if state.ids.installationID != "" {
+		if updated, errSet := sjson.SetBytes(next, "client_metadata.x-codex-installation-id", state.ids.installationID); errSet == nil {
 			next = updated
 			changed = true
 		}
 	}
+	if state.convergesSession() {
+		next, changed = setCodexConvergenceBodyString(next, "client_metadata.session_id", state.ids.sessionID, changed)
+		next, changed = setCodexConvergenceBodyString(next, "client_metadata.thread_id", state.ids.threadID, changed)
+		next, changed = setCodexConvergenceBodyString(next, "client_metadata.turn_id", state.ids.turnID, changed)
+		next, changed = setCodexConvergenceBodyString(next, "client_metadata.root_turn_id", state.ids.rootTurnID, changed)
+		next, changed = setCodexConvergenceBodyString(next, "client_metadata.x-codex-window-id", state.ids.windowID, changed)
+		next, changed = setCodexConvergenceBodyString(next, "client_metadata.x-codex-parent-thread-id", state.ids.parentThreadID, changed)
+		next, changed = setCodexConvergenceBodyString(next, "client_metadata.parent_turn_id", state.ids.parentTurnID, changed)
+		next, changed = setCodexConvergenceBodyString(next, "client_metadata.forked_from_thread_id", state.ids.forkedFromThreadID, changed)
+		next, changed = setCodexConvergenceBodyString(next, "client_metadata.context_window_id", state.ids.contextWindowID, changed)
+		next, changed = setCodexConvergenceBodyString(next, "client_metadata."+codexSubagentBodyKey, state.ids.subagent, changed)
+	}
+	if updated, rewritten := rewriteCodexConvergenceEmbeddedMetadataJSON(next, state); rewritten {
+		next = updated
+		changed = true
+	}
+	if updated, updatedOK := rewriteCodexConvergenceExistingPromptCacheKey(next, state); updatedOK {
+		next = updated
+		changed = true
+	}
 	return next, changed
 }
 
-func setCodexConvergencePromptCacheKey(body []byte, promptCacheKey string) ([]byte, bool) {
-	updated, errSet := sjson.SetBytes(body, "prompt_cache_key", promptCacheKey)
+func setCodexConvergenceBodyString(body []byte, path, value string, changed bool) ([]byte, bool) {
+	if strings.TrimSpace(value) == "" {
+		return body, changed
+	}
+	updated, errSet := sjson.SetBytes(body, path, value)
+	if errSet != nil {
+		return body, changed
+	}
+	return updated, true
+}
+
+func rewriteCodexConvergenceExistingPromptCacheKey(body []byte, state codexFingerprintConvergenceState) ([]byte, bool) {
+	if state.ids.promptCacheKey == "" || !gjson.GetBytes(body, "prompt_cache_key").Exists() {
+		return body, false
+	}
+	updated, errSet := sjson.SetBytes(body, "prompt_cache_key", state.ids.promptCacheKey)
 	if errSet != nil {
 		return body, false
 	}
 	return updated, true
 }
 
-func rewriteCodexConvergenceEmbeddedMetadata(clientMetadata map[string]any, state codexFingerprintConvergenceState) {
-	key := codexTurnMetadataBodyKey
-	raw, ok := clientMetadata[key].(string)
-	if !ok || strings.TrimSpace(raw) == "" {
-		key = codexTurnMetadataHeader
-		raw, ok = clientMetadata[key].(string)
+func rewriteCodexConvergenceEmbeddedMetadataJSON(body []byte, state codexFingerprintConvergenceState) ([]byte, bool) {
+	changed := false
+	for _, key := range []string{codexTurnMetadataBodyKey, codexTurnMetadataHeader} {
+		path := "client_metadata." + key
+		raw := gjson.GetBytes(body, path)
+		if raw.Type != gjson.String || strings.TrimSpace(raw.String()) == "" {
+			continue
+		}
+		rebuilt := applyCodexConvergenceMetadataJSON(raw.String(), state)
+		if rebuilt == raw.String() {
+			continue
+		}
+		updated, errSet := sjson.SetBytes(body, path, rebuilt)
+		if errSet != nil {
+			continue
+		}
+		body = updated
+		changed = true
 	}
-	if !ok || strings.TrimSpace(raw) == "" {
-		return
-	}
-	var metadata map[string]any
-	if err := json.Unmarshal([]byte(raw), &metadata); err != nil || metadata == nil {
-		metadata = make(map[string]any)
-	}
-	applyCodexConvergenceMetadataFields(metadata, state)
-	if rebuilt, errMarshal := json.Marshal(metadata); errMarshal == nil {
-		clientMetadata[key] = string(rebuilt)
-	}
+	return body, changed
 }
 
 // applyCodexFingerprintConvergenceHeaders rewrites the outbound identity headers.
@@ -566,7 +605,11 @@ func applyCodexFingerprintConvergenceHeaders(headers http.Header, state codexFin
 		headers.Set("X-Codex-Installation-Id", state.ids.installationID)
 	}
 	if state.rawTurnMetadata != "" {
-		rewriteCodexConvergenceHeaderMetadata(headers, state)
+		rebuilt := applyCodexConvergenceMetadataJSON(state.rawTurnMetadata, state)
+		headers.Set(codexTurnMetadataHeader, rebuilt)
+	}
+	if state.ids.subagent != "" {
+		headers.Set(codexSubagentHeader, state.ids.subagent)
 	}
 	if !state.convergesSession() {
 		return
@@ -587,49 +630,44 @@ func applyCodexFingerprintConvergenceHeaders(headers http.Header, state codexFin
 	}
 	headers.Set("Thread-Id", state.ids.threadID)
 	headers.Set("X-Client-Request-Id", state.ids.threadID)
-	headers.Set("X-Codex-Window-Id", state.ids.windowID)
+	if state.ids.windowID != "" {
+		headers.Set("X-Codex-Window-Id", state.ids.windowID)
+	}
 	if state.ids.parentThreadID != "" {
 		headers.Set("X-Codex-Parent-Thread-Id", state.ids.parentThreadID)
 	}
 }
 
-func rewriteCodexConvergenceHeaderMetadata(headers http.Header, state codexFingerprintConvergenceState) {
-	var metadata map[string]any
-	if err := json.Unmarshal([]byte(state.rawTurnMetadata), &metadata); err != nil || metadata == nil {
-		metadata = make(map[string]any)
+func applyCodexConvergenceMetadataJSON(raw string, state codexFingerprintConvergenceState) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !state.active() {
+		return raw
 	}
-	applyCodexConvergenceMetadataFields(metadata, state)
-	rebuilt, errMarshal := json.Marshal(metadata)
-	if errMarshal != nil {
-		return
+	next := []byte(raw)
+	if !gjson.ValidBytes(next) || !gjson.ParseBytes(next).IsObject() {
+		next = []byte("{}")
 	}
-	headers.Set(codexTurnMetadataHeader, string(rebuilt))
-}
-
-func applyCodexConvergenceMetadataFields(metadata map[string]any, state codexFingerprintConvergenceState) {
-	if metadata == nil || !state.active() {
-		return
+	set := func(key, value string) {
+		if strings.TrimSpace(value) == "" {
+			return
+		}
+		if updated, errSet := sjson.SetBytes(next, key, value); errSet == nil {
+			next = updated
+		}
 	}
-	if state.ids.installationID != "" {
-		metadata["installation_id"] = state.ids.installationID
-	}
+	set("installation_id", state.ids.installationID)
 	if !state.convergesSession() {
-		return
+		return string(next)
 	}
-	metadata["session_id"] = state.ids.sessionID
-	metadata["thread_id"] = state.ids.threadID
-	metadata["turn_id"] = state.ids.turnID
-	if state.ids.rootTurnID != "" {
-		metadata["root_turn_id"] = state.ids.rootTurnID
-	}
-	metadata["window_id"] = state.ids.windowID
-	if state.ids.parentThreadID != "" {
-		metadata["parent_thread_id"] = state.ids.parentThreadID
-	}
-	if state.ids.contextWindowID != "" {
-		metadata["context_window_id"] = state.ids.contextWindowID
-	}
-	if state.ids.turnStartedAtMs > 0 {
-		metadata["turn_started_at_unix_ms"] = state.ids.turnStartedAtMs
-	}
+	set("session_id", state.ids.sessionID)
+	set("thread_id", state.ids.threadID)
+	set("turn_id", state.ids.turnID)
+	set("root_turn_id", state.ids.rootTurnID)
+	set("window_id", state.ids.windowID)
+	set("parent_thread_id", state.ids.parentThreadID)
+	set("parent_turn_id", state.ids.parentTurnID)
+	set("forked_from_thread_id", state.ids.forkedFromThreadID)
+	set("context_window_id", state.ids.contextWindowID)
+	set(codexSubagentBodyKey, state.ids.subagent)
+	return string(next)
 }

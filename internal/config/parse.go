@@ -101,6 +101,9 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.SanitizeXAIKeys()
 	cfg.SanitizeCodexHeaderDefaults()
 	cfg.SanitizeCodexFingerprintConvergence()
+	if err := ValidateCodexFingerprintConvergence(cfg.Codex.FingerprintConvergence); err != nil {
+		return nil, err
+	}
 	cfg.SanitizeClaudeHeaderDefaults()
 	cfg.SanitizeClaudeKeys()
 	cfg.SanitizeOpenAICompatibility()

@@ -45,8 +45,8 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 
 // SanitizeCodexFingerprintConvergence normalizes the configured Codex fingerprint
 // convergence mode. Only a recognized value is rewritten; an unrecognized one is
-// preserved as written so sanitizing a config file never destroys operator input,
-// while the request path falls back to off and reports it once.
+// trimmed in place so the subsequent load/parse ValidateCodexFingerprintConvergence
+// call can fail with the operator's original token.
 func (cfg *Config) SanitizeCodexFingerprintConvergence() {
 	if cfg == nil {
 		return

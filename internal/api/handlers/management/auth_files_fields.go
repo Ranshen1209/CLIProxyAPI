@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
@@ -310,6 +311,14 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		} else if rootAuthFileField(fieldPath) == coreauth.AttributeWeight {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "weight does not support nested fields"})
 			return
+		} else if fieldPath == coreauth.AttributeFingerprintConvergence {
+			if errFingerprint := applyAuthFileFingerprintConvergencePatch(targetAuth.Metadata, value); errFingerprint != nil {
+				c.JSON(http.StatusUnprocessableEntity, gin.H{"error": errFingerprint.Error()})
+				return
+			}
+		} else if rootAuthFileField(fieldPath) == coreauth.AttributeFingerprintConvergence {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "fingerprint_convergence does not support nested fields"})
+			return
 		} else if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
@@ -559,6 +568,9 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	if _, ok := touchedRoots[coreauth.AttributeWeight]; ok {
 		syncAuthFileWeightAttribute(auth)
 	}
+	if _, ok := touchedRoots[coreauth.AttributeFingerprintConvergence]; ok {
+		syncAuthFileFingerprintConvergenceAttribute(auth)
+	}
 	if _, ok := touchedRoots["note"]; ok {
 		syncAuthFileNoteAttribute(auth)
 	}
@@ -619,6 +631,64 @@ func syncAuthFileWeightAttribute(auth *coreauth.Auth) {
 		return
 	}
 	auth.Attributes[coreauth.AttributeWeight] = strconv.FormatInt(weight, 10)
+}
+
+func applyAuthFileFingerprintConvergencePatch(metadata map[string]any, value any) error {
+	delete(metadata, "fingerprint-convergence")
+	if value == nil {
+		delete(metadata, coreauth.AttributeFingerprintConvergence)
+		return nil
+	}
+	raw := fingerprintConvergenceRawFromAuthField(value)
+	if err := config.ValidateCodexFingerprintConvergence(raw); err != nil {
+		return err
+	}
+	normalized, _ := config.NormalizeCodexFingerprintConvergence(raw)
+	metadata[coreauth.AttributeFingerprintConvergence] = normalized
+	return nil
+}
+
+func fingerprintConvergenceRawFromAuthField(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	case json.Number:
+		return typed.String()
+	case float64:
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	default:
+		return fmt.Sprintf("%v", value)
+	}
+}
+
+func syncAuthFileFingerprintConvergenceAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	delete(auth.Attributes, "fingerprint-convergence")
+	raw, ok := auth.Metadata[coreauth.AttributeFingerprintConvergence]
+	if !ok || raw == nil {
+		delete(auth.Attributes, coreauth.AttributeFingerprintConvergence)
+		return
+	}
+	if asString, okString := raw.(string); okString {
+		trimmed := strings.TrimSpace(asString)
+		if trimmed == "" {
+			delete(auth.Attributes, coreauth.AttributeFingerprintConvergence)
+			return
+		}
+		auth.Attributes[coreauth.AttributeFingerprintConvergence] = trimmed
+		return
+	}
+	auth.Attributes[coreauth.AttributeFingerprintConvergence] = fingerprintConvergenceRawFromAuthField(raw)
 }
 
 func authFileIntValue(value any) (int, bool) {

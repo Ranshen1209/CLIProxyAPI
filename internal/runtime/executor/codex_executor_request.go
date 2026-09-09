@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -80,8 +81,47 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
+	httpReq, errConverge := applyCodexFingerprintConvergenceHTTPRequest(e.cfg, auth, httpReq)
+	if errConverge != nil {
+		return nil, errConverge
+	}
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
+}
+
+func applyCodexFingerprintConvergenceHTTPRequest(cfg *config.Config, auth *cliproxyauth.Auth, req *http.Request) (*http.Request, error) {
+	if req == nil || !codexConvergenceModeEnabled(cfg, auth) {
+		return req, nil
+	}
+	if req.Body == nil {
+		state := resolveCodexFingerprintConvergence(cfg, auth, req.Header, nil, nil, "", codexConvergenceHeadersHyphen)
+		applyCodexFingerprintConvergenceHeaders(req.Header, state)
+		return req, nil
+	}
+	body, errRead := io.ReadAll(req.Body)
+	_ = req.Body.Close()
+	if errRead != nil {
+		return nil, fmt.Errorf("codex executor: read request body: %w", errRead)
+	}
+	replaceBody := func(next []byte) {
+		req.Body = io.NopCloser(bytes.NewReader(next))
+		req.ContentLength = int64(len(next))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(next)), nil
+		}
+	}
+	if !gjson.ParseBytes(body).IsObject() {
+		replaceBody(body)
+		return req, nil
+	}
+	cacheID := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
+	state := resolveCodexFingerprintConvergence(cfg, auth, req.Header, body, body, cacheID, codexConvergenceHeadersHyphen)
+	if updated, changed := applyCodexFingerprintConvergenceBody(body, state); changed {
+		body = updated
+	}
+	applyCodexFingerprintConvergenceHeaders(req.Header, state)
+	replaceBody(body)
+	return req, nil
 }
 
 type codexIdentityConfuseState struct {
@@ -106,8 +146,8 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 }
 
 // cacheHelperWithConvergence is cacheHelper with an explicit switch for the body
-// side of fingerprint convergence. The compact form carries no client_metadata by
-// design, so it converges only the outbound headers.
+// side of fingerprint convergence. Compact uses the same body rules: it never
+// invents client_metadata and only rewrites an existing prompt_cache_key.
 func (e *CodexExecutor) cacheHelperWithConvergence(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte, convergeBody bool, headerSets ...http.Header) (*http.Request, []byte, codexIdentityConfuseState, error) {
 	var headers http.Header
 	if len(headerSets) > 0 {
