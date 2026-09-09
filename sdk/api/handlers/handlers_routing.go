@@ -10,6 +10,7 @@ import (
 
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -238,8 +239,12 @@ func (h *BaseAPIHandler) validateImageOnlyModel(modelName string, allowImageMode
 }
 
 func isOpenAIImageOnlyModel(model string) bool {
-	switch strings.ToLower(strings.TrimSpace(routeModelBaseName(model))) {
-	case "gpt-image-1.5", "gpt-image-2", "grok-imagine-image", "grok-imagine-image-quality", "grok-imagine-image-2.0":
+	baseModel := strings.ToLower(strings.TrimSpace(routeModelBaseName(model)))
+	if registry.IsCodexImageGenerationModel(baseModel) {
+		return true
+	}
+	switch baseModel {
+	case "grok-imagine-image", "grok-imagine-image-quality", "grok-imagine-image-2.0":
 		return true
 	default:
 		return false

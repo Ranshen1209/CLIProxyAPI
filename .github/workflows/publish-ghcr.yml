@@ -27,7 +27,7 @@ jobs:
 
       - name: Test fingerprint and config packages
         run: |
-          go test ./internal/config ./internal/runtime/executor ./internal/watcher/diff ./internal/api/handlers/management ./sdk/cliproxy/auth
+          go test ./internal/config ./internal/runtime/executor ./internal/registry ./internal/watcher/diff ./internal/api/handlers/management ./sdk/cliproxy ./sdk/cliproxy/auth ./sdk/api/handlers ./sdk/api/handlers/openai
 
   build:
     name: Build and push linux/amd64
