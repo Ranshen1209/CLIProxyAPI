@@ -90,6 +90,10 @@ type codexIdentityConfuseState struct {
 	originalPromptCacheKey string
 	promptCacheKey         string
 	turnIDs                []codexIdentityReplacement
+	// convergence carries the resolved Codex fingerprint convergence identity for
+	// the same attempt. It is applied by applyCodexIdentityConfuseHeaders so every
+	// transport applies body and headers from one resolved snapshot.
+	convergence codexFingerprintConvergenceState
 }
 
 type codexIdentityReplacement struct {
@@ -98,6 +102,13 @@ type codexIdentityReplacement struct {
 }
 
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte, headerSets ...http.Header) (*http.Request, []byte, codexIdentityConfuseState, error) {
+	return e.cacheHelperWithConvergence(ctx, from, url, auth, req, userPayload, rawJSON, true, headerSets...)
+}
+
+// cacheHelperWithConvergence is cacheHelper with an explicit switch for the body
+// side of fingerprint convergence. The compact form carries no client_metadata by
+// design, so it converges only the outbound headers.
+func (e *CodexExecutor) cacheHelperWithConvergence(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte, convergeBody bool, headerSets ...http.Header) (*http.Request, []byte, codexIdentityConfuseState, error) {
 	var headers http.Header
 	if len(headerSets) > 0 {
 		headers = headerSets[0]
@@ -146,6 +157,21 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if identityState.promptCacheKey != "" {
 		cache.ID = identityState.promptCacheKey
 	}
+	// Fingerprint convergence supersedes identity-confuse when enabled. The body
+	// rewrite runs before the request is built so headers and body share one
+	// resolved identity snapshot (see applyCodexIdentityConfuseHeaders).
+	identityState.convergence = resolveCodexFingerprintConvergence(
+		e.cfg, auth, headers, rawJSON, userPayload, cache.ID, codexConvergenceHeadersHyphen)
+	if identityState.convergence.active() {
+		if identityState.convergence.ids.promptCacheKey != "" {
+			cache.ID = identityState.convergence.ids.promptCacheKey
+		}
+		if convergeBody {
+			if updated, changed := applyCodexFingerprintConvergenceBody(rawJSON, identityState.convergence); changed {
+				rawJSON = updated
+			}
+		}
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
 		return nil, nil, codexIdentityConfuseState{}, err
@@ -157,7 +183,9 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 }
 
 func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte) ([]byte, codexIdentityConfuseState) {
-	if !codexIdentityConfuseEnabled(cfg) || auth == nil || strings.TrimSpace(auth.ID) == "" || len(rawJSON) == 0 {
+	// Fingerprint convergence rewrites the same fields with stronger, shape-aware
+	// rules; running both would stack two derivations on one value.
+	if !codexIdentityConfuseEnabled(cfg) || codexConvergenceModeEnabled(cfg, auth) || auth == nil || strings.TrimSpace(auth.ID) == "" || len(rawJSON) == 0 {
 		return rawJSON, codexIdentityConfuseState{}
 	}
 
@@ -183,10 +211,19 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 }
 
 func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityConfuseState) {
-	if headers == nil {
+	if headers == nil || state == nil {
 		return
 	}
-	if state == nil || !state.enabled {
+	if state.enabled {
+		applyCodexIdentityConfuseHeadersOnly(headers, state)
+	}
+	if state.convergence.active() {
+		applyCodexFingerprintConvergenceHeaders(headers, state.convergence)
+	}
+}
+
+func applyCodexIdentityConfuseHeadersOnly(headers http.Header, state *codexIdentityConfuseState) {
+	if headers == nil || state == nil || !state.enabled {
 		return
 	}
 

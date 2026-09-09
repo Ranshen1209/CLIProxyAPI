@@ -43,6 +43,21 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
 }
 
+// SanitizeCodexFingerprintConvergence normalizes the configured Codex fingerprint
+// convergence mode. Only a recognized value is rewritten; an unrecognized one is
+// preserved as written so sanitizing a config file never destroys operator input,
+// while the request path falls back to off and reports it once.
+func (cfg *Config) SanitizeCodexFingerprintConvergence() {
+	if cfg == nil {
+		return
+	}
+	if normalized, ok := NormalizeCodexFingerprintConvergence(cfg.Codex.FingerprintConvergence); ok {
+		cfg.Codex.FingerprintConvergence = normalized
+		return
+	}
+	cfg.Codex.FingerprintConvergence = strings.TrimSpace(cfg.Codex.FingerprintConvergence)
+}
+
 // SanitizeClaudeHeaderDefaults trims surrounding whitespace from the
 // configured Claude fingerprint baseline values.
 func (cfg *Config) SanitizeClaudeHeaderDefaults() {

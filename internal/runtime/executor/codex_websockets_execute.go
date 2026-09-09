@@ -85,6 +85,14 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	clientBody := body
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
+	identityState.convergence = resolveCodexFingerprintConvergence(
+		e.cfg, auth, opts.Headers, upstreamBody, originalPayloadSource,
+		strings.TrimSpace(gjson.GetBytes(upstreamBody, "prompt_cache_key").String()), codexConvergenceHeadersUnderscore)
+	if identityState.convergence.active() {
+		if updated, changed := applyCodexFingerprintConvergenceBody(upstreamBody, identityState.convergence); changed {
+			upstreamBody = updated
+		}
+	}
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, opts.Headers)
 	applyModelHeaderOverrides(wsHeaders, baseModel)

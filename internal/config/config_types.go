@@ -164,6 +164,12 @@ type AntigravityConnectionPoolConfig struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	// FingerprintConvergence converges Codex upstream device/session identity per
+	// credential so a shared OAuth account does not expose every downstream client
+	// as a distinct device and conversation. Values: "off" (default), "device",
+	// "session", "full" (see NormalizeCodexFingerprintConvergence). It is an
+	// explicit opt-in and supersedes identity-confuse when enabled.
+	FingerprintConvergence string `yaml:"fingerprint-convergence" json:"fingerprint-convergence"`
 	// DisableCodexCloaking disables forcing the official Codex identity headers on HTTP/SSE and WebSocket requests.
 	DisableCodexCloaking bool `yaml:"disable-codex-cloaking" json:"disable-codex-cloaking"`
 	// StreamBootstrapBuffering holds back initial handshake events (response.created,

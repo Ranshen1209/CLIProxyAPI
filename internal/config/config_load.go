@@ -165,6 +165,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
 
+	// Sanitize the Codex fingerprint convergence mode.
+	cfg.SanitizeCodexFingerprintConvergence()
+
 	// Sanitize Claude header defaults.
 	cfg.SanitizeClaudeHeaderDefaults()
 

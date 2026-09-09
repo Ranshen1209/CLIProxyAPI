@@ -243,7 +243,23 @@ codex:
   # remap Codex prompt_cache_key and installation identity per selected auth.
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
+  # Superseded by fingerprint-convergence when that is enabled.
   identity-confuse: false
+  # Converge Codex device/session identity per credential so a shared OAuth account
+  # does not look like many distinct devices and conversations to the upstream.
+  # Values: off (default), device, session, full.
+  #   device  - x-codex-installation-id becomes a per-credential constant; sessions untouched.
+  #   session - device plus deterministic per-(credential, client session) derivation of
+  #             session-id / thread-id / turn-id / root-turn-id / x-codex-window-id /
+  #             context-window-id, preserving the real Codex relationships (root session
+  #             session_id == thread_id, subagent thread_id != session_id, window_id is
+  #             "<thread>:<n>") and the UUIDv7 version/timestamp. Derived values are stable
+  #             for the same client session, so prompt-cache affinity is preserved.
+  #   full    - session plus collapsing every subagent thread onto the converged session.
+  # Only applied to Codex credentials; explicit opt-in. Session affinity is recommended
+  # (not required) so a conversation keeps hitting the credential whose derived identity it
+  # already warmed.
+  fingerprint-convergence: off
   # Disable forcing the official Codex User-Agent and Originator headers on HTTP/SSE and WebSocket requests.
   disable-codex-cloaking: false
   # Hold back the initial handshake events (response.created, response.in_progress and the
