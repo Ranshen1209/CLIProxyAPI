@@ -1821,16 +1821,19 @@ func TestApplyCodexWebsocketHeaders_EmptyAPIKey_OmitsAuthorizationAndOAuthHeader
 	}
 }
 
-func TestApplyModelHeaderOverridesFromModelConfig(t *testing.T) {
+func TestApplyModelHeaderOverridesKeepsOAuthIdentity(t *testing.T) {
 	const wantUA = "codex-tui/0.153.3 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.153.3)"
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
 	}
+	// Production runs with disable-codex-cloaking: true, so the configured User-Agent is the
+	// one that reaches upstream and the catalog override must not replace it.
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent: "config-ua",
 		},
+		Codex: config.CodexConfig{DisableCodexCloaking: true},
 	}
 	auth := &cliproxyauth.Auth{
 		Provider: "codex",
@@ -1838,18 +1841,26 @@ func TestApplyModelHeaderOverridesFromModelConfig(t *testing.T) {
 	}
 
 	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
-	applyModelHeaderOverrides(req.Header, "gpt-5.6-luna")
+	applyModelHeaderOverrides(req.Header, "gpt-5.6-luna", auth)
 
-	if got := req.Header.Get("User-Agent"); got != wantUA {
-		t.Fatalf("User-Agent = %q, want %q", got, wantUA)
-	}
-	if got := codexSessionHeaderValue(req.Header); got == "" {
-		t.Fatal("expected Session_id to be set for Mac OS User-Agent override")
+	if got := req.Header.Get("User-Agent"); got != "config-ua" {
+		t.Fatalf("User-Agent = %q, want the gateway identity config-ua", got)
 	}
 
-	applyModelHeaderOverrides(req.Header, "gpt-5.4")
-	if got := req.Header.Get("User-Agent"); got != wantUA {
-		t.Fatalf("User-Agent after no-op override = %q, want %q", got, wantUA)
+	applyModelHeaderOverrides(req.Header, "gpt-5.4", auth)
+	if got := req.Header.Get("User-Agent"); got != "config-ua" {
+		t.Fatalf("User-Agent after no-op override = %q, want config-ua", got)
+	}
+
+	// codex-api-key entries have no configured identity, so the catalog override still owns them.
+	apiKeyAuth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test"}}
+	apiKeyHeaders := http.Header{}
+	applyModelHeaderOverrides(apiKeyHeaders, "gpt-5.6-luna", apiKeyAuth)
+	if got := apiKeyHeaders.Get("User-Agent"); got != wantUA {
+		t.Fatalf("api-key User-Agent = %q, want the catalog override %q", got, wantUA)
+	}
+	if got := apiKeyHeaders.Get("Originator"); got != codexOriginator {
+		t.Fatalf("api-key Originator = %q, want %q", got, codexOriginator)
 	}
 }
 
@@ -1862,27 +1873,54 @@ func TestApplyModelHeaderOverridesMultipleHeaders(t *testing.T) {
 			OverrideHeader: map[string]string{
 				"user-agent":    "custom-ua/1.0",
 				"originator":    "custom-origin",
+				"version":       "9.9.9",
 				"x-test-header": "forced-value",
 			},
 		},
 	}})
 	t.Cleanup(func() { reg.UnregisterClient(clientID) })
 
-	headers := http.Header{}
-	headers.Set("User-Agent", "old-ua")
-	headers.Set("Originator", "old-origin")
-	headers.Set("X-Test-Header", "old-value")
+	apiKeyAuth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test"}}
+	apiKeyHeaders := http.Header{}
+	apiKeyHeaders.Set("User-Agent", "old-ua")
+	apiKeyHeaders.Set("Originator", "old-origin")
+	apiKeyHeaders.Set("X-Test-Header", "old-value")
 
-	applyModelHeaderOverrides(headers, "test-override-headers-model")
+	applyModelHeaderOverrides(apiKeyHeaders, "test-override-headers-model", apiKeyAuth)
 
-	if got := headers.Get("User-Agent"); got != "custom-ua/1.0" {
-		t.Fatalf("User-Agent = %q, want custom-ua/1.0", got)
+	if got := apiKeyHeaders.Get("User-Agent"); got != "custom-ua/1.0" {
+		t.Fatalf("api-key User-Agent = %q, want custom-ua/1.0", got)
 	}
-	if got := headers.Get("Originator"); got != "custom-origin" {
-		t.Fatalf("Originator = %q, want custom-origin", got)
+	if got := apiKeyHeaders.Get("Originator"); got != "custom-origin" {
+		t.Fatalf("api-key Originator = %q, want custom-origin", got)
 	}
-	if got := headers.Get("X-Test-Header"); got != "forced-value" {
-		t.Fatalf("X-Test-Header = %q, want forced-value", got)
+	if got := apiKeyHeaders.Get("Version"); got != "9.9.9" {
+		t.Fatalf("api-key Version = %q, want 9.9.9", got)
+	}
+	if got := apiKeyHeaders.Get("X-Test-Header"); got != "forced-value" {
+		t.Fatalf("api-key X-Test-Header = %q, want forced-value", got)
+	}
+
+	oauthAuth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"email": "user@example.com"}}
+	oauthHeaders := http.Header{}
+	oauthHeaders.Set("User-Agent", "gateway-ua")
+	oauthHeaders.Set("Originator", "gateway-origin")
+	oauthHeaders.Set("Version", "0.153.4")
+	oauthHeaders.Set("X-Test-Header", "old-value")
+
+	applyModelHeaderOverrides(oauthHeaders, "test-override-headers-model", oauthAuth)
+
+	if got := oauthHeaders.Get("User-Agent"); got != "gateway-ua" {
+		t.Fatalf("oauth User-Agent = %q, want gateway-ua", got)
+	}
+	if got := oauthHeaders.Get("Originator"); got != "gateway-origin" {
+		t.Fatalf("oauth Originator = %q, want gateway-origin", got)
+	}
+	if got := oauthHeaders.Get("Version"); got != "0.153.4" {
+		t.Fatalf("oauth Version = %q, want 0.153.4", got)
+	}
+	if got := oauthHeaders.Get("X-Test-Header"); got != "forced-value" {
+		t.Fatalf("oauth X-Test-Header = %q, want forced-value", got)
 	}
 }
 

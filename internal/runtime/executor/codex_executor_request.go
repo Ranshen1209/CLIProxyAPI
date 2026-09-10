@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -17,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
@@ -365,8 +367,34 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
 }
 
+// codexIdentityHeaderKeys are the upstream client-identity headers owned by the Codex
+// identity layer (applyCodexHeaders / applyCodexWebsocketHeaders). Upstream
+// /backend-api/codex deprioritises requests by client identity while capacity is tight and
+// answers the deprioritised ones with HTTP 200 plus an in-stream server_is_overloaded, so
+// User-Agent, Originator and Version must stay one self-consistent identity decided here.
+var codexIdentityHeaderKeys = map[string]struct{}{
+	"user-agent": {},
+	"originator": {},
+	"version":    {},
+}
+
+// codexIdentityOverrideWarned deduplicates the "catalog identity ignored" debug line.
+// Model overrides are evaluated on every request, so logging per call would flood debug logs.
+var codexIdentityOverrideWarned sync.Map
+
+func isCodexIdentityHeaderKey(key string) bool {
+	_, ok := codexIdentityHeaderKeys[strings.ToLower(strings.TrimSpace(key))]
+	return ok
+}
+
 // applyModelHeaderOverrides forces models.json config.override_header onto upstream headers.
-func applyModelHeaderOverrides(headers http.Header, modelName string) {
+//
+// Identity keys are skipped for OAuth credentials: models.json is refreshed from a remote
+// catalog, and a catalog entry must not be able to pin a third-party or stale client identity
+// (e.g. gpt-5.6-luna's codex-tui User-Agent) on a request whose identity this gateway already
+// decided. codex-api-key entries have no configured identity, so their override keeps owning
+// every key, User-Agent included.
+func applyModelHeaderOverrides(headers http.Header, modelName string, auth *cliproxyauth.Auth) {
 	if headers == nil {
 		return
 	}
@@ -374,7 +402,14 @@ func applyModelHeaderOverrides(headers http.Header, modelName string) {
 	if len(overrides) == 0 {
 		return
 	}
+	lockIdentity := !codexAuthUsesAPIKey(auth)
 	for key, value := range overrides {
+		if lockIdentity && isCodexIdentityHeaderKey(key) {
+			if _, warned := codexIdentityOverrideWarned.LoadOrStore(modelName+"|"+key, struct{}{}); !warned {
+				log.Debugf("codex executor: ignoring models.json override_header %q for model %q on an OAuth request; the gateway owns the Codex identity", key, modelName)
+			}
+			continue
+		}
 		headers.Set(key, value)
 	}
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") && codexSessionHeaderValue(headers) == "" {
