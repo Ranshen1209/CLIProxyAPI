@@ -18,9 +18,9 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -30,7 +30,12 @@ const (
 	codexOriginator            = "codex-tui"
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
-	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
+	// codexResponsesBetaHeaderValue is the Responses beta declaration the HTTP/SSE surface
+	// sends to /backend-api/codex; the websocket surface declares responses_websockets
+	// instead (codexResponsesWebsocketBetaHeaderValue). This is the value the official
+	// client and the eca-new-api codex adaptor use.
+	codexResponsesBetaHeaderValue = "responses=experimental"
+	codexResponsesLiteMetadata    = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
 var dataTag = []byte("data:")
@@ -472,6 +477,18 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 				r.Header.Set("Chatgpt-Account-Id", accountID)
 			}
 		}
+	}
+	// The Responses beta declaration is part of the official client fingerprint on this
+	// surface. A client value that already declares it is kept so extra tokens survive;
+	// anything else is replaced by the canonical declaration.
+	clientBeta := ""
+	if ginHeaders != nil {
+		clientBeta = strings.TrimSpace(ginHeaders.Get("OpenAI-Beta"))
+	}
+	if strings.Contains(clientBeta, codexResponsesBetaHeaderValue) {
+		r.Header.Set("OpenAI-Beta", clientBeta)
+	} else {
+		r.Header.Set("OpenAI-Beta", codexResponsesBetaHeaderValue)
 	}
 	var attrs map[string]string
 	if auth != nil {

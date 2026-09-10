@@ -1924,6 +1924,75 @@ func TestApplyModelHeaderOverridesMultipleHeaders(t *testing.T) {
 	}
 }
 
+// The HTTP/SSE surface must declare the Responses beta the official client and the gateway
+// codex adaptor use, while x-codex-beta-features stays client-owned there (the config value is
+// websocket-only by design).
+func TestApplyCodexHeadersResponsesBetaAndBetaFeaturesPrecedence(t *testing.T) {
+	oauthAuth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"email": "user@example.com"}}
+	// Header.Set canonicalizes the key the same way gin's parser does; a literal map key such as
+	// "OpenAI-Beta" would not be found by Header.Get.
+	clientHeader := func(key, value string) http.Header {
+		h := http.Header{}
+		h.Set(key, value)
+		return h
+	}
+
+	cases := []struct {
+		name             string
+		cfgBetaFeatures  string
+		clientHeaders    http.Header
+		wantBeta         string
+		wantBetaFeatures string
+	}{
+		{
+			name:     "no client beta header gets the canonical declaration",
+			wantBeta: "responses=experimental",
+		},
+		{
+			name:          "client declaration with extra tokens is preserved",
+			clientHeaders: clientHeader("OpenAI-Beta", "responses=experimental,foo=bar"),
+			wantBeta:      "responses=experimental,foo=bar",
+		},
+		{
+			name:          "foreign client declaration is replaced",
+			clientHeaders: clientHeader("OpenAI-Beta", "realtime=v1"),
+			wantBeta:      "responses=experimental",
+		},
+		{
+			// The client capability header stays client-owned on the HTTP surface; the
+			// codex-header-defaults value deliberately applies to websocket requests only.
+			name:             "configured beta features do not leak into the http surface",
+			cfgBetaFeatures:  "multi_agent",
+			clientHeaders:    clientHeader("X-Codex-Beta-Features", "client-beta"),
+			wantBeta:         "responses=experimental",
+			wantBetaFeatures: "client-beta",
+		},
+		{
+			name:             "absent client beta features stay absent when config is unset",
+			wantBeta:         "responses=experimental",
+			wantBetaFeatures: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Codex: config.CodexConfig{DisableCodexCloaking: true}}
+			cfg.CodexHeaderDefaults.BetaFeatures = tc.cfgBetaFeatures
+			req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+			if err != nil {
+				t.Fatalf("NewRequest() error = %v", err)
+			}
+			applyCodexHeaders(req, oauthAuth, "oauth-token", true, cfg, tc.clientHeaders)
+			if got := req.Header.Get("OpenAI-Beta"); got != tc.wantBeta {
+				t.Fatalf("OpenAI-Beta = %q, want %q", got, tc.wantBeta)
+			}
+			if got := req.Header.Get("X-Codex-Beta-Features"); got != tc.wantBetaFeatures {
+				t.Fatalf("X-Codex-Beta-Features = %q, want %q", got, tc.wantBetaFeatures)
+			}
+		})
+	}
+}
+
 func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {
