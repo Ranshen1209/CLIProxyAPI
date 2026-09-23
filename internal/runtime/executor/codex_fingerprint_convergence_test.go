@@ -687,3 +687,65 @@ func TestCodexConvergenceHTTPRequestSkipsNonJSON(t *testing.T) {
 		t.Fatalf("SDP body changed: %q", body)
 	}
 }
+
+// Both initial websocket streams and later duplex response.create frames use this preparation path.
+func TestCodexConvergencePreparedWebsocketStream(t *testing.T) {
+	for _, mode := range []string{"off", "device", "session", "full"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := convergenceTestConfig(mode)
+			cfg.Codex.DisableCodexCloaking = true
+			executor := NewCodexWebsocketsExecutor(cfg)
+			auth := convergenceTestAuth("account-a")
+			auth.Attributes = map[string]string{"header:User-Agent": "gateway-test", "header:Originator": "gateway-origin"}
+			raw := "019d2233-e240-7162-992d-38df0a2a0e0d"
+			payload := []byte(`{"model":"gpt-5.6-luna","instructions":"test","input":[],"prompt_cache_key":"` + raw + `","client_metadata":{"session_id":"` + raw + `","thread_id":"` + raw + `"}}`)
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex"), Headers: http.Header{"Session-Id": {raw}, "Thread-Id": {raw}}}
+			req := cliproxyexecutor.Request{Model: "gpt-5.6-luna", Payload: payload}
+			first, err := executor.prepareCodexWebsocketStream(context.Background(), auth, req, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := executor.prepareCodexWebsocketStream(context.Background(), auth, req, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := first.wsHeaders.Get("User-Agent"); got != "gateway-test" {
+				t.Fatalf("catalog replaced gateway identity: %q", got)
+			}
+			if got := first.wsHeaders.Get("Originator"); got != "gateway-origin" {
+				t.Fatalf("originator = %q", got)
+			}
+			if !bytes.Equal(first.clientBody, second.clientBody) {
+				t.Fatal("client payload changed between equivalent requests")
+			}
+			if got := gjson.GetBytes(first.clientBody, "client_metadata.session_id").String(); got != raw {
+				t.Fatalf("client session rewritten: %q", got)
+			}
+			want := raw
+			if mode == "session" || mode == "full" {
+				want = first.identityState.convergence.ids.sessionID
+				if want == "" || want == raw {
+					t.Fatal("session convergence was lost in websocket preparation")
+				}
+				if got := first.wsHeaders["session_id"]; len(got) != 1 || got[0] != want {
+					t.Fatalf("wire session = %#v, want %q", got, want)
+				}
+				if first.wsHeaders.Get("Session-Id") != "" {
+					t.Fatal("duplicate hyphenated session header")
+				}
+			}
+			if got := gjson.GetBytes(first.upstreamBody, "client_metadata.session_id").String(); got != want {
+				t.Fatalf("upstream session = %q, want %q", got, want)
+			}
+			if got := gjson.GetBytes(second.upstreamBody, "client_metadata.session_id").String(); got != want {
+				t.Fatalf("follow-up session = %q, want %q", got, want)
+			}
+			if mode != "off" {
+				installation := first.wsHeaders.Get("X-Codex-Installation-Id")
+				if installation == "" || second.wsHeaders.Get("X-Codex-Installation-Id") != installation {
+					t.Fatal("installation identity is not stable")
+				}
+			}
+		})
+	}
+}

@@ -11,6 +11,7 @@ const (
 	codexBuiltinImageModelID           = "gpt-image-2"
 	codexBuiltinImage25FlareModelID    = "gpt-image-2.5-flare"
 	codexBuiltinImage25SunburstModelID = "gpt-image-2.5-sunburst"
+	codexBuiltinImage25ModelID         = "gpt-image-2.5"
 	xaiBuiltinImageModelID             = "grok-imagine-image"
 	xaiBuiltinImageQualityModelID      = "grok-imagine-image-quality"
 	xaiBuiltinImage20ModelID           = "grok-imagine-image-2.0"
@@ -32,6 +33,8 @@ type staticModelsJSON struct {
 	Kimi        []*ModelInfo `json:"kimi"`
 	Antigravity []*ModelInfo `json:"antigravity"`
 	XAI         []*ModelInfo `json:"xai"`
+	Devin       []*ModelInfo `json:"devin"`
+	Meta        []*ModelInfo `json:"meta"`
 }
 
 // GetClaudeModels returns the standard Claude model definitions.
@@ -84,6 +87,130 @@ func GetAntigravityModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Antigravity)
 }
 
+var staticDevinModels = []*ModelInfo{
+	{
+		ID:                  "devin/swe-2",
+		Type:                "devin",
+		OwnedBy:             "cognition",
+		DisplayName:         "SWE-2",
+		ContextLength:       262000,
+		MaxCompletionTokens: 128000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"medium", "high", "max"},
+		},
+	},
+	{
+		ID:                  "devin/claude-fable-5-1",
+		Type:                "devin",
+		OwnedBy:             "anthropic",
+		DisplayName:         "Claude Fable 5.1",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "medium", "high", "xhigh", "max"},
+		},
+	},
+	{
+		ID:                  "devin/gpt-6-astra",
+		Type:                "devin",
+		OwnedBy:             "openai",
+		DisplayName:         "GPT-6 Astra",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "medium", "high", "xhigh", "max"},
+		},
+	},
+	{
+		ID:                  "devin/glm-5-2",
+		Type:                "devin",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-5.2",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "high"},
+		},
+	},
+	{
+		ID:                  "devin/glm-5-3",
+		Type:                "devin",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-5.3",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 128000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "high", "max"},
+		},
+	},
+	{
+		ID:                  "devin/glm-5-3-flash",
+		Type:                "devin",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-5.3 Flash",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 128000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "high", "max"},
+		},
+	},
+	{
+		ID:                  "devin/gpt-5-6-sol",
+		Type:                "devin",
+		OwnedBy:             "openai",
+		DisplayName:         "GPT-5.6 Sol",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 128000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "low", "medium", "high", "xhigh", "max"},
+		},
+	},
+	{
+		ID:                  "devin/gemini-3-8-flash",
+		Type:                "devin",
+		OwnedBy:             "google",
+		DisplayName:         "Gemini 3.8 Flash",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 65536,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "medium", "high"},
+		},
+	},
+	{
+		ID:                  "devin/grok-4-6",
+		Type:                "devin",
+		OwnedBy:             "xai",
+		DisplayName:         "Grok 4.6",
+		ContextLength:       500000,
+		MaxCompletionTokens: 131072,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "medium", "high", "xhigh"},
+		},
+	},
+	{
+		ID:                  "devin/deepseek-v4-flash",
+		Type:                "devin",
+		OwnedBy:             "deepseek",
+		DisplayName:         "DeepSeek V4 Flash",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"high", "max"},
+		},
+	},
+	{
+		ID:                  "devin/deepseek-v4-1-flash",
+		Type:                "devin",
+		OwnedBy:             "deepseek",
+		DisplayName:         "DeepSeek V4.1 Flash",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"high", "max"},
+		},
+	},
+}
+
 // AntigravityWebSearchModelFor returns the Antigravity model that should run a
 // native web search request for modelID.
 func AntigravityWebSearchModelFor(modelID string) string {
@@ -123,6 +250,7 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 		codexBuiltinImageModelInfo(),
 		codexBuiltinImage25FlareModelInfo(),
 		codexBuiltinImage25SunburstModelInfo(),
+		codexBuiltinImage25ModelInfo(),
 	)
 }
 
@@ -135,7 +263,7 @@ func IsCodexImageGenerationModel(modelID string) bool {
 	}
 	switch id {
 	case codexBuiltinImage15ModelID, codexBuiltinImageModelID,
-		codexBuiltinImage25FlareModelID, codexBuiltinImage25SunburstModelID:
+		codexBuiltinImage25FlareModelID, codexBuiltinImage25SunburstModelID, codexBuiltinImage25ModelID:
 		return true
 	default:
 		return strings.HasPrefix(id, codexBuiltinImage25FlareModelID+"-") ||
@@ -185,7 +313,7 @@ func codexBuiltinImage25FlareModelInfo() *ModelInfo {
 	return &ModelInfo{
 		ID:          codexBuiltinImage25FlareModelID,
 		Object:      "model",
-		Created:     1788825600, // 2026-09-08
+		Created:     1704067200, // 2024-01-01
 		OwnedBy:     "openai",
 		Type:        "openai",
 		DisplayName: "GPT Image 2.5 Flare",
@@ -197,11 +325,23 @@ func codexBuiltinImage25SunburstModelInfo() *ModelInfo {
 	return &ModelInfo{
 		ID:          codexBuiltinImage25SunburstModelID,
 		Object:      "model",
-		Created:     1788825600, // 2026-09-08
+		Created:     1704067200, // 2024-01-01
 		OwnedBy:     "openai",
 		Type:        "openai",
 		DisplayName: "GPT Image 2.5 Sunburst",
 		Version:     codexBuiltinImage25SunburstModelID,
+	}
+}
+
+func codexBuiltinImage25ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          codexBuiltinImage25ModelID,
+		Object:      "model",
+		Created:     1704067200, // 2024-01-01
+		OwnedBy:     "openai",
+		Type:        "openai",
+		DisplayName: "GPT Image 2.5",
+		Version:     codexBuiltinImage25ModelID,
 	}
 }
 
@@ -354,6 +494,8 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 //   - kimi
 //   - antigravity
 //   - xai
+//   - devin
+//   - meta
 func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	key := strings.ToLower(strings.TrimSpace(channel))
 	switch key {
@@ -369,15 +511,39 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetAIStudioModels()
 	case "codex":
 		return GetCodexProModels()
-	case "kimi":
+	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
 		return GetKimiModels()
 	case "antigravity":
 		return GetAntigravityModels()
 	case "xai", "x-ai", "grok":
 		return GetXAIModels()
+	case "devin":
+		return GetDevinModels()
+	case "meta", "muse":
+		return GetMetaModels()
 	default:
 		return nil
 	}
+}
+
+// LookupStaticModelInfoByChannel searches one provider-specific static section.
+// It does not fall back across providers, so callers can preserve provenance.
+func LookupStaticModelInfoByChannel(modelID, channel string) *ModelInfo {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil
+	}
+	for _, model := range GetStaticModelDefinitionsByChannel(channel) {
+		if model != nil && model.ID == modelID {
+			return cloneModelInfo(model)
+		}
+	}
+	return nil
+}
+
+// GetMetaModels returns the standard Meta Muse model definitions.
+func GetMetaModels() []*ModelInfo {
+	return cloneModelInfos(getModels().Meta)
 }
 
 // LookupStaticModelInfo searches all static model definitions for a model by ID.
@@ -397,6 +563,9 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.Kimi,
 		data.Antigravity,
 		data.XAI,
+		data.Devin,
+		staticDevinModels,
+		data.Meta,
 	}
 	for _, models := range allModels {
 		for _, m := range models {

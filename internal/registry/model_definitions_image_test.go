@@ -14,7 +14,7 @@ func TestIsCodexImageGenerationModel(t *testing.T) {
 		{model: "codex/gpt-image-2.5-sunburst", want: true},
 		{model: "gpt-image-2.5-flare-2026-09-08", want: true},
 		{model: "gpt-image-2.5-sunburst-2026-09-08", want: true},
-		{model: "gpt-image-2.5", want: false},
+		{model: "gpt-image-2.5", want: true},
 		{model: "gpt-5.4", want: false},
 		{model: "grok-imagine-image", want: false},
 	}
