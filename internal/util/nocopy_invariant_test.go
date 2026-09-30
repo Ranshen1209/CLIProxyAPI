@@ -21,7 +21,13 @@ var inPlaceSJSONAllowlist = map[string]struct{}{}
 // forEachSourceFile visits every non-test Go file in the repository.
 func forEachSourceFile(t *testing.T, root string, visit func(rel string, data []byte)) {
 	t.Helper()
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	// Read the root explicitly: on Windows an NTFS junction can be reported
+	// as an irregular file by WalkDir, even though ReadDir can traverse it.
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read repository root: %v", err)
+	}
+	visitEntry := func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -48,9 +54,11 @@ func forEachSourceFile(t *testing.T, root string, visit func(rel string, data []
 		}
 		visit(filepath.ToSlash(rel), data)
 		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk repository: %v", err)
+	}
+	for _, entry := range entries {
+		if err = filepath.WalkDir(filepath.Join(root, entry.Name()), visitEntry); err != nil {
+			t.Fatalf("walk repository: %v", err)
+		}
 	}
 }
 

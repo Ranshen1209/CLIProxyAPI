@@ -96,3 +96,39 @@ func TestParseConfigBytesAcceptsFingerprintConvergenceSession(t *testing.T) {
 		t.Fatalf("FingerprintConvergence = %q, want %q", got, CodexFingerprintConvergenceSession)
 	}
 }
+
+func TestFingerprintConvergenceV8MigrationRoundTrip(t *testing.T) {
+	for _, input := range []string{
+		"codex:\n  fingerprint-convergence: session\n  identity-confuse: true\n",
+		"oauth:\n  providers:\n    codex:\n      fingerprint-convergence: session\n      identity-confuse: true\n",
+	} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(input), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Codex.FingerprintConvergence != CodexFingerprintConvergenceSession || !cfg.Codex.IdentityConfuse {
+			t.Fatal("load lost fork identity settings")
+		}
+		if err = SaveConfigPreserveComments(path, cfg, true); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = ValidateV8Config(data); err != nil {
+			t.Fatal(err)
+		}
+		reloaded, err := LoadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reloaded.Codex.FingerprintConvergence != cfg.Codex.FingerprintConvergence || reloaded.Codex.IdentityConfuse != cfg.Codex.IdentityConfuse {
+			t.Fatal("v8 save/reload lost fork identity settings")
+		}
+	}
+}
