@@ -91,6 +91,13 @@ func TestConfigV8MigrationAndLegacyAPI(t *testing.T) {
 	if err != nil || loaded.RequestRetry != 5 {
 		t.Fatalf("v0 update to v8 config failed: %v", err)
 	}
+	saved, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = config.ValidateV8Config(saved); err != nil || !strings.Contains(string(saved), "config-version: 8") {
+		t.Fatalf("v0 did not preserve the existing v8 layout: %v", err)
+	}
 	request(http.MethodPut, "/v8/management/config/requests/proxy-url", `"direct"`, 200)
 	loaded, err = config.LoadConfig(path)
 	if err != nil || loaded.ProxyURL != "direct" {
@@ -224,7 +231,7 @@ func TestConfigV8CommentsUnknownNestedFieldsOnWrite(t *testing.T) {
 	if err != nil || string(unchanged) != string(saved) {
 		t.Fatalf("invalid new setting changed the config: %v", err)
 	}
-	request(http.MethodDelete, "/v8/management/config/oauth/providers/codex/disable-codex-cloaking", "", http.StatusOK)
+	request(http.MethodDelete, "/v8/management/config/upstream/codex/disable-codex-cloaking", "", http.StatusOK)
 	saved, err = os.ReadFile(path)
 	if err != nil || strings.Count(string(saved), "# oauth.providers.codex.retired-setting: false") != 1 {
 		t.Fatalf("deleting the neighboring setting lost the archived comment: %v\n%s", err, saved)
@@ -306,8 +313,17 @@ func TestV8MigrationReloadSnapshotMatchesDisk(t *testing.T) {
 					t.Fatal("reload snapshot has different OAuth scope from the saved file")
 				}
 				api := snapshot.ForAPIKey()
-				if api.Codex.DisableCodexCloaking == tc.migrated || api.XAI.InjectXSearch == tc.migrated {
+				if !api.Codex.DisableCodexCloaking || !api.XAI.InjectXSearch {
 					t.Fatal("reload snapshot applied the wrong API-key configuration")
+				}
+				if tc.migrated {
+					data, errRead := os.ReadFile(path)
+					if errRead != nil {
+						t.Fatal(errRead)
+					}
+					if errValidate := config.ValidateV8Config(data); errValidate != nil {
+						t.Fatal(errValidate)
+					}
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("missing config reload")
@@ -375,7 +391,7 @@ func TestConfigV8DeleteLastField(t *testing.T) {
 		{"websocket", "ws-auth: false\n", "oauth/providers/aistudio/ws-auth", func(cfg *config.Config) bool { return cfg.WebsocketAuth }},
 		{"debug", "debug: true\n", "observability/logs/debug", func(cfg *config.Config) bool { return !cfg.Debug }},
 		{"sibling", "routing: {strategy: fill-first, retry: {request-retry: 3}}\n", "routing/retry/request-retry", func(cfg *config.Config) bool { return cfg.RequestRetry == 0 && cfg.Routing.Strategy == "fill-first" }},
-		{"provider", "oauth: {providers: {codex: {disable-codex-cloaking: true}}}\n", "oauth/providers/codex/disable-codex-cloaking", func(cfg *config.Config) bool { return !cfg.Codex.DisableCodexCloaking }},
+		{"provider", "oauth: {providers: {codex: {disable-codex-cloaking: true}}}\n", "upstream/codex/disable-codex-cloaking", func(cfg *config.Config) bool { return !cfg.Codex.DisableCodexCloaking }},
 		{"excluded models", "oauth: {excluded-models: {codex: [blocked-model]}}\n", "oauth/excluded-models", func(cfg *config.Config) bool { return len(cfg.OAuthExcludedModels) == 0 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -605,5 +621,272 @@ func TestConfigV8JSONTURNSecrets(t *testing.T) {
 		if server := loaded.Codex.LiveMediaRelay.ICEServers[0]; server.Username != "" || server.Credential != "" {
 			t.Fatal("unexpected inherited TURN credentials")
 		}
+	}
+}
+
+func TestConfigV8DeletePreservesDocumentPresence(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	file := filepath.Join(t.TempDir(), "config.yaml")
+	raw := `# Keep document comment
+config-version: 8
+server: {port: 8317}
+routing:
+  retry:
+    request-retry: 3
+    max-retry-interval: 30
+plugins:
+  configs:
+    sample:
+      enabled: false
+      options: {} # Keep empty mapping
+      custom-null: null # Keep explicit null
+      custom-tree: {unknown: [one, {two: 2}]}
+`
+	if err := os.WriteFile(file, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Home = config.HomeConfig{Enabled: true, Host: "runtime.example"}
+	h := &Handler{cfg: cfg, configFilePath: file}
+	reloads := make(chan *config.Config, 8)
+	h.SetConfigReloadHook(func(_ context.Context, cfg *config.Config) { reloads <- cfg })
+	router := gin.New()
+	router.DELETE("/v8/management/config/*path", h.ConfigV8)
+	router.GET("/v8/management/config/*path", h.ConfigV8)
+	request := func(method, path string, status int, body string) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(method, "/v8/management/config/"+path, nil))
+		if w.Code != status || (body != "" && strings.TrimSpace(w.Body.String()) != body) {
+			t.Fatalf("%s %s: status=%d body=%s", method, path, w.Code, w.Body.String())
+		}
+	}
+	read := func() ([]byte, *yaml.Node) {
+		t.Helper()
+		data, errRead := os.ReadFile(file)
+		if errRead != nil {
+			t.Fatal(errRead)
+		}
+		var doc yaml.Node
+		if errDecode := yaml.Unmarshal(data, &doc); errDecode != nil {
+			t.Fatal(errDecode)
+		}
+		return data, doc.Content[0]
+	}
+	checkReload := func() {
+		t.Helper()
+		loaded, errLoad := config.LoadConfig(file)
+		if errLoad != nil {
+			t.Fatal(errLoad)
+		}
+		loaded.Home = cfg.Home
+		select {
+		case snapshot := <-reloads:
+			if !reflect.DeepEqual(snapshot, loaded) || !reflect.DeepEqual(h.cfg, loaded) {
+				t.Fatal("runtime config or reload snapshot differs from persisted config")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("missing reload")
+		}
+	}
+	_, original := read()
+	request(http.MethodDelete, "routing/retry/request-retry", http.StatusOK, "")
+	checkReload()
+	// Simulate a new sibling written on the server after the first deletion.
+	// The next request must use the latest file, not a stale runtime projection.
+	data, _ := read()
+	data = []byte(strings.Replace(string(data), "max-retry-interval: 30", "max-retry-interval: 30\n        max-retry-credentials: 7 # Keep new sibling", 1))
+	if err = os.WriteFile(file, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	request(http.MethodDelete, "routing/retry/max-retry-interval", http.StatusOK, "")
+	checkReload()
+	data, root := read()
+	for _, path := range []string{"routing/retry/request-retry", "routing/retry/max-retry-interval", "observability", "server/host"} {
+		if configV8Node(root, strings.Split(path, "/")) != nil {
+			t.Fatalf("absent field was materialized: %s", path)
+		}
+		request(http.MethodGet, path, http.StatusNotFound, "")
+	}
+	request(http.MethodGet, "routing/retry/max-retry-credentials", http.StatusOK, "7")
+	// Apart from the requested removals and the server-side sibling, the whole
+	// document must retain the same presence and values (including null/maps).
+	expected := cloneConfigV8Node(original)
+	deleteConfigV8Path(expected, []string{"routing", "retry", "request-retry"})
+	retry := configV8Node(expected, []string{"routing", "retry"})
+	retry.Content = append(retry.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "max-retry-credentials"},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: "7"})
+	deleteConfigV8Path(expected, []string{"routing", "retry", "max-retry-interval"})
+	var expectedValue, actualValue any
+	if err = expected.Decode(&expectedValue); err != nil {
+		t.Fatal(err)
+	}
+	if err = root.Decode(&actualValue); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(expectedValue, actualValue) {
+		t.Fatal("DELETE changed unrelated document fields or their presence")
+	}
+	pluginPath := []string{"plugins", "configs", "sample"}
+	var beforePlugin, afterPlugin any
+	if err = configV8Node(original, pluginPath).Decode(&beforePlugin); err != nil {
+		t.Fatal(err)
+	}
+	if err = configV8Node(root, pluginPath).Decode(&afterPlugin); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(beforePlugin, afterPlugin) {
+		t.Fatal("opaque plugin settings changed")
+	}
+	for _, comment := range []string{"# Keep document comment", "# Keep empty mapping", "# Keep explicit null", "# Keep new sibling"} {
+		if !strings.Contains(string(data), comment) {
+			t.Fatalf("lost comment %s", comment)
+		}
+	}
+	for _, tc := range []struct{ name, body string }{{"options", "{}"}, {"custom-null", "null"}} {
+		path := "plugins/configs/sample/" + tc.name
+		request(http.MethodGet, path, http.StatusOK, tc.body)
+		request(http.MethodDelete, path, http.StatusOK, "")
+		checkReload()
+		request(http.MethodGet, path, http.StatusNotFound, "")
+		request(http.MethodDelete, path, http.StatusNotFound, "")
+	}
+}
+
+func TestConfigV8SaveNormalizesCollectionStylesToBlockYAML(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	file := filepath.Join(t.TempDir(), "config.yaml")
+	raw := `config-version: 8
+server:
+  port: 8317
+api-keys:
+  openai-compatibility:
+    - name: compat-provider
+      base-url: "https://api.example.com"
+      headers:
+        User-Agent: "$User-Agent"
+      models:
+        - alias: "coding"
+          name: "gpt-4o"
+      keys:
+        - api-key: "sk-compat-1"
+`
+	if errWrite := os.WriteFile(file, []byte(raw), 0600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	cfg, errLoad := config.LoadConfig(file)
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	h := &Handler{cfg: cfg, configFilePath: file}
+	router := gin.New()
+	router.PUT("/v8/management/config", h.ConfigV8)
+	router.PUT("/v8/management/config/*path", h.ConfigV8)
+	router.PATCH("/v8/management/config", h.ConfigV8)
+
+	// Send JSON update simulating v8 management panel saving complex items
+	jsonUpdate := `[{"name":"compat-provider","base-url":"https://api.example.com","headers":{"User-Agent":"$User-Agent"},"models":[{"alias":"coding","name":"gpt-4o"}],"keys":[{"api-key":"sk-compat-1"}]}]`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/v8/management/config/api-keys/openai-compatibility", strings.NewReader(jsonUpdate))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT failed: status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	saved, errRead := os.ReadFile(file)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	savedStr := string(saved)
+
+	// Ensure the saved config does NOT contain inline JSON / flow style for complex collections
+	if strings.Contains(savedStr, "[{") || strings.Contains(savedStr, `headers: {`) || strings.Contains(savedStr, `models: [{`) {
+		t.Fatalf("config contains flow style / inline JSON collections:\n%s", savedStr)
+	}
+	if !strings.Contains(savedStr, "openai-compatibility:") || !strings.Contains(savedStr, "- name:") || !strings.Contains(savedStr, "base-url:") {
+		t.Fatalf("expected block style sequence with unquoted keys for openai-compatibility, got:\n%s", savedStr)
+	}
+	if strings.Contains(savedStr, `"name":`) || strings.Contains(savedStr, `"base-url":`) {
+		t.Fatalf("expected keys to be unquoted in block YAML, got:\n%s", savedStr)
+	}
+
+	// Also test PATCH at root /v8/management/config with JSON
+	patchJSON := `{"api-keys":{"openai-compatibility":[{"name":"compat-provider-2","base-url":"https://api.example2.com","headers":{"User-Agent":"$User-Agent-2"},"models":[{"alias":"coding-2","name":"gpt-4o-mini"}],"keys":[{"api-key":"sk-compat-2"}]}]}}`
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPatch, "/v8/management/config", strings.NewReader(patchJSON))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH failed: status=%d body=%s", w.Code, w.Body.String())
+	}
+	saved, errRead = os.ReadFile(file)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	savedStr = string(saved)
+	if strings.Contains(savedStr, "[{") || strings.Contains(savedStr, `headers: {`) || strings.Contains(savedStr, `models: [{`) {
+		t.Fatalf("PATCH saved config contains flow style / inline JSON collections:\n%s", savedStr)
+	}
+	if !strings.Contains(savedStr, "openai-compatibility:") || !strings.Contains(savedStr, "- name:") {
+		t.Fatalf("expected block style sequence after PATCH for openai-compatibility, got:\n%s", savedStr)
+	}
+
+	// Verify that empty sequence retains flow style []
+	emptyJSON := `{"server":{"trusted-proxies":[]}}`
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPatch, "/v8/management/config", strings.NewReader(emptyJSON))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH with empty sequence failed: status=%d body=%s", w.Code, w.Body.String())
+	}
+	saved, errRead = os.ReadFile(file)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	savedStr = string(saved)
+	if !strings.Contains(savedStr, "trusted-proxies: []") {
+		t.Fatalf("expected empty sequence to retain flow style [], got:\n%s", savedStr)
+	}
+
+	// Also test root PUT with entire JSON document
+	rootPutJSON := `{"config-version":8,"server":{"port":8317},"api-keys":{"openai-compatibility":[{"name":"compat-provider-root","base-url":"https://api.example3.com","headers":{"User-Agent":"$User-Agent-3"},"models":[{"alias":"coding-3","name":"gpt-4o"}],"keys":[{"api-key":"sk-compat-3"}]}]}}`
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPut, "/v8/management/config", strings.NewReader(rootPutJSON))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("root PUT failed: status=%d body=%s", w.Code, w.Body.String())
+	}
+	saved, errRead = os.ReadFile(file)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	savedStr = string(saved)
+	if strings.Contains(savedStr, "[{") || strings.Contains(savedStr, `headers: {`) || strings.Contains(savedStr, `models: [{`) {
+		t.Fatalf("root PUT saved config contains flow style / inline JSON collections:\n%s", savedStr)
+	}
+	if strings.Contains(savedStr, `"config-version":`) || strings.Contains(savedStr, `"server":`) || strings.Contains(savedStr, `"api-keys":`) {
+		t.Fatalf("root PUT saved config contains quoted keys:\n%s", savedStr)
+	}
+	if !strings.Contains(savedStr, "compat-provider-root") {
+		t.Fatalf("expected compat-provider-root in saved config, got:\n%s", savedStr)
+	}
+
+	// Verify the final saved file loads correctly into Config
+	loaded, errLoaded := config.LoadConfig(file)
+	if errLoaded != nil {
+		t.Fatalf("LoadConfig failed on normalized saved YAML: %v", errLoaded)
+	}
+	if len(loaded.OpenAICompatibility) != 1 || loaded.OpenAICompatibility[0].Name != "compat-provider-root" {
+		t.Fatalf("unexpected loaded config content: %+v", loaded.OpenAICompatibility)
+	}
+	if loaded.OpenAICompatibility[0].Headers["User-Agent"] != "$User-Agent-3" {
+		t.Fatalf("unexpected loaded headers: %+v", loaded.OpenAICompatibility[0].Headers)
 	}
 }

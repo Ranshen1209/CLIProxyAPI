@@ -77,7 +77,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}
 
-	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
+	wsReqBody := frameCodexWebsocketRequestBody(upstreamBody)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -195,7 +195,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			readCh = sess.activate(conn)
 			restoreMultiAgentV2 = !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
-			wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBody)
+			wsReqBodyRetry := frameCodexWebsocketRequestBody(upstreamBody)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       wsURL,
 				Method:    "WEBSOCKET",
@@ -629,38 +629,47 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if wsErr, ok := parseCodexWebsocketErrorWithCooling(payload, e.modelLevelCooling()); ok {
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
+				// The disconnect notification makes the downstream handler close the client and
+				// cancel the request context, so it must follow delivery of the error to the
+				// conductor; otherwise the cancellation can drop the error and its cooldown.
 				if sess != nil {
-					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
+					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "upstream_error", wsErr)
 				}
 				if errClearReplay := clearCodexReasoningReplayOnWebsocketError(ctx, replayScope, payload); errClearReplay != nil {
 					terminateErr = errClearReplay
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "replay_clear_error", errClearReplay)
 					reporter.PublishFailure(ctx, errClearReplay)
 					_ = send(cliproxyexecutor.StreamChunk{Err: errClearReplay})
+					sess.notifyUpstreamDisconnect(wsErr)
 					return
 				}
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
 				reporter.PublishFailure(ctx, wsErr)
 				_ = send(cliproxyexecutor.StreamChunk{Err: wsErr})
+				sess.notifyUpstreamDisconnect(wsErr)
 				return
 			}
 			if streamErr, terminalBody, ok := codexTerminalFailureErrWithCooling(payload, e.modelLevelCooling()); ok {
 				terminateReason = "upstream_error"
 				terminateErr = streamErr
+				// Publish the downstream disconnect only after the error was delivered, see the
+				// upstream error branch above.
 				if sess != nil {
 					unlockStreamSession()
-					e.invalidateUpstreamConn(sess, conn, "terminal_failure", streamErr)
+					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "terminal_failure", streamErr)
 				}
 				if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 					terminateErr = errClearReplay
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "replay_clear_error", errClearReplay)
 					reporter.PublishFailure(ctx, errClearReplay)
 					_ = send(cliproxyexecutor.StreamChunk{Err: errClearReplay})
+					sess.notifyUpstreamDisconnect(streamErr)
 					return
 				}
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", streamErr)
 				reporter.PublishFailure(ctx, streamErr)
 				_ = send(cliproxyexecutor.StreamChunk{Err: streamErr})
+				sess.notifyUpstreamDisconnect(streamErr)
 				return
 			}
 
@@ -777,16 +786,17 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 	}
 	originalPayload := originalPayloadSource
 	isCompat := e.resolveCodexModelIsCompat(auth, req, baseModel)
-	originalTranslated, body, updatesChanged := translateCodexRequestPairWithUpdateIntent(from, to, baseModel, originalPayload, req.Payload, true, isCompat)
+	originalTranslated, body, updatesChanged, err := translateCodexRequestPairWithUpdateIntent(from, to, baseModel, originalPayload, req.Payload, true, isCompat)
+	if err != nil {
+		return nil, err
+	}
 
 	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier(), updatesChanged)
 	if err != nil {
 		return nil, err
 	}
 
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	finalizePayload := helps.NewPayloadFinalizer(e.cfg, "codex-websockets", baseModel, to.String(), "", originalTranslated, req, opts)
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body = normalizeCodexInstructions(body, preserveNativeOutput)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
@@ -812,6 +822,7 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 	if errPromptCache != nil {
 		return nil, errPromptCache
 	}
+	body = finalizePayload(helps.SanitizeCodexInputItemIDs(body))
 	clientBody := body
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
