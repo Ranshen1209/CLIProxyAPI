@@ -22,9 +22,10 @@ import (
 // responsesLocalInterrupt cancels an in-flight HTTP turn. A websocket upstream
 // does not use it; that interrupt is written to the existing socket instead.
 type responsesLocalInterrupt struct {
-	mu     sync.Mutex
-	active bool
-	frames chan []byte
+	mu         sync.Mutex
+	active     bool
+	responseID string
+	frames     chan []byte
 }
 
 func newResponsesLocalInterrupt() *responsesLocalInterrupt {
@@ -37,6 +38,7 @@ func (s *responsesLocalInterrupt) begin() {
 	}
 	s.mu.Lock()
 	s.active = true
+	s.responseID = ""
 	s.mu.Unlock()
 }
 
@@ -46,11 +48,37 @@ func (s *responsesLocalInterrupt) end() {
 	}
 	s.mu.Lock()
 	s.active = false
+	s.responseID = ""
 	select {
 	case <-s.frames:
 	default:
 	}
 	s.mu.Unlock()
+}
+
+// observeResponse updates cancellation eligibility before exposing an event to
+// the client. Completion must not leave a window for a stale local interrupt.
+func (s *responsesLocalInterrupt) observeResponse(payload []byte) {
+	if s == nil {
+		return
+	}
+	event := gjson.GetBytes(payload, "type").String()
+	if event != "response.created" && event != "response.completed" && event != "response.done" && event != "response.incomplete" && event != "response.failed" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if event == "response.created" {
+		s.active = true
+		s.responseID = gjson.GetBytes(payload, "response.id").String()
+		return
+	}
+	s.active = false
+	s.responseID = ""
+	select {
+	case <-s.frames:
+	default:
+	}
 }
 
 func (s *responsesLocalInterrupt) deliver(payload []byte) bool {
@@ -59,7 +87,7 @@ func (s *responsesLocalInterrupt) deliver(payload []byte) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.active {
+	if !s.active || s.responseID == "" || gjson.GetBytes(payload, "response_id").String() != s.responseID {
 		return false
 	}
 	select {

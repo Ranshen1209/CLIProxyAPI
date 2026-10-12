@@ -250,3 +250,40 @@ func TestResponsesInterruptDiagnosticsAreSanitized(t *testing.T) {
 		t.Fatal("timeline was not finalized")
 	}
 }
+
+// Local HTTP cancellation must only accept an observed, active response ID.
+func TestResponsesLocalInterruptRejectsUnknownResponse(t *testing.T) {
+	local := newResponsesLocalInterrupt()
+	local.begin()
+	defer local.end()
+	if local.deliver([]byte(`{"type":"response.interrupt","response_id":"unknown"}`)) {
+		t.Fatal("unknown response ID was admitted as a local HTTP cancellation")
+	}
+}
+
+func TestResponsesLocalInterruptOnlyCancelsMatchingActiveResponse(t *testing.T) {
+	for _, terminal := range []string{"response.completed", "response.done", "response.incomplete", "response.failed"} {
+		t.Run(terminal, func(t *testing.T) {
+			local := newResponsesLocalInterrupt()
+			local.begin()
+			defer local.end()
+			local.observeResponse([]byte(`{"type":"response.created","response":{"id":"active"}}`))
+			if local.deliver([]byte(`{"type":"response.interrupt","response_id":"unknown"}`)) {
+				t.Fatal("unknown interrupt affected the active response")
+			}
+			interrupt := []byte(`{"type":"response.interrupt","response_id":"active"}`)
+			if !local.deliver(interrupt) {
+				t.Fatal("matching active interrupt was rejected")
+			}
+			local.observeResponse([]byte(fmt.Sprintf(`{"type":%q,"response":{"id":"active"}}`, terminal)))
+			if local.deliver(interrupt) {
+				t.Fatal("terminal response accepted a stale local interrupt")
+			}
+			select {
+			case <-local.framesChan():
+				t.Fatal("completion retained a queued local interrupt")
+			default:
+			}
+		})
+	}
+}
