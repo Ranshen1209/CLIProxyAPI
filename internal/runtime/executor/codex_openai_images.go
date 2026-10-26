@@ -86,8 +86,14 @@ func (e *CodexExecutor) resolveGPTImage2BaseModel() string {
 }
 
 func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	if directEndpoint := codexDirectOpenAIImageEndpoint(req, opts); directEndpoint != "" {
-		return e.executeDirectOpenAIImage(ctx, auth, req, opts, directEndpoint)
+	apiKey, baseURL := codexCredsForRequest(ctx, auth, opts.Headers)
+	if errSIWC := ensureCodexSIWCCredentialsForRequest(ctx, auth, apiKey, opts.Headers); errSIWC != nil {
+		return resp, errSIWC
+	}
+	if !codexUseSIWCForRequest(ctx, auth, opts.Headers) {
+		if directEndpoint := codexDirectOpenAIImageEndpoint(req, opts); directEndpoint != "" {
+			return e.executeDirectOpenAIImage(ctx, auth, req, opts, directEndpoint)
+		}
 	}
 
 	prepared, errPrepare := codexPrepareOpenAIImageRequest(req, opts)
@@ -95,7 +101,6 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		return resp, errPrepare
 	}
 
-	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
@@ -104,7 +109,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	reporter := helps.NewExecutorUsageReporter(ctx, e, mainModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	body, errBuild := e.prepareCodexOpenAIImageBody(prepared.Body, req, opts, mainModel)
+	body, errBuild := e.prepareCodexOpenAIImageBody(ctx, auth, prepared.Body, req, opts, mainModel)
 	if errBuild != nil {
 		return resp, errBuild
 	}
@@ -187,8 +192,14 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 }
 
 func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
-	if directEndpoint := codexDirectOpenAIImageEndpoint(req, opts); directEndpoint != "" {
-		return e.executeDirectOpenAIImageStream(ctx, auth, req, opts, directEndpoint)
+	apiKey, baseURL := codexCredsForRequest(ctx, auth, opts.Headers)
+	if errSIWC := ensureCodexSIWCCredentialsForRequest(ctx, auth, apiKey, opts.Headers); errSIWC != nil {
+		return nil, errSIWC
+	}
+	if !codexUseSIWCForRequest(ctx, auth, opts.Headers) {
+		if directEndpoint := codexDirectOpenAIImageEndpoint(req, opts); directEndpoint != "" {
+			return e.executeDirectOpenAIImageStream(ctx, auth, req, opts, directEndpoint)
+		}
 	}
 
 	prepared, errPrepare := codexPrepareOpenAIImageRequest(req, opts)
@@ -196,7 +207,6 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		return nil, errPrepare
 	}
 
-	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
@@ -205,7 +215,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	reporter := helps.NewExecutorUsageReporter(ctx, e, mainModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	body, errBuild := e.prepareCodexOpenAIImageBody(prepared.Body, req, opts, mainModel)
+	body, errBuild := e.prepareCodexOpenAIImageBody(ctx, auth, prepared.Body, req, opts, mainModel)
 	if errBuild != nil {
 		return nil, errBuild
 	}
@@ -333,7 +343,7 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 		return resp, errPrepare
 	}
 
-	apiKey, baseURL := codexCreds(auth)
+	apiKey, baseURL := codexCredsForRequest(ctx, auth, opts.Headers)
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
@@ -357,7 +367,7 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 	httpReq.Body = io.NopCloser(bytes.NewReader(body))
 	httpReq.ContentLength = int64(len(body))
 	httpReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
-	applyCodexDirectImageHeaders(httpReq, auth, apiKey, false, e.cfg)
+	applyCodexDirectImageHeaders(httpReq, auth, apiKey, false, e.cfg, opts.Headers)
 	applyModelHeaderOverrides(httpReq.Header, model, auth)
 	if contentType != "" {
 		httpReq.Header.Set("Content-Type", contentType)
@@ -403,7 +413,7 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 		return nil, errPrepare
 	}
 
-	apiKey, baseURL := codexCreds(auth)
+	apiKey, baseURL := codexCredsForRequest(ctx, auth, opts.Headers)
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
@@ -427,7 +437,7 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 	httpReq.Body = io.NopCloser(bytes.NewReader(body))
 	httpReq.ContentLength = int64(len(body))
 	httpReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
-	applyCodexDirectImageHeaders(httpReq, auth, apiKey, true, e.cfg)
+	applyCodexDirectImageHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers)
 	applyModelHeaderOverrides(httpReq.Header, model, auth)
 	if contentType != "" {
 		httpReq.Header.Set("Content-Type", contentType)
@@ -727,7 +737,7 @@ func codexIsDirectOpenAIImageModel(model string) bool {
 	return registry.IsCodexImageGenerationModel(model)
 }
 
-func (e *CodexExecutor) prepareCodexOpenAIImageBody(body []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, mainModel string) ([]byte, error) {
+func (e *CodexExecutor) prepareCodexOpenAIImageBody(ctx context.Context, auth *cliproxyauth.Auth, body []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, mainModel string) ([]byte, error) {
 	out := body
 	mainModel = strings.TrimSpace(mainModel)
 	if mainModel == "" {
@@ -745,6 +755,9 @@ func (e *CodexExecutor) prepareCodexOpenAIImageBody(body []byte, req cliproxyexe
 	out, _ = sjson.DeleteBytes(out, "prompt_cache_retention")
 	out, _ = sjson.DeleteBytes(out, "safety_identifier")
 	out, _ = sjson.DeleteBytes(out, "stream_options")
+	if codexUseSIWCForRequest(ctx, auth, opts.Headers) {
+		return applyCodexSIWCRequestBodyRules(out, false), nil
+	}
 	return normalizeCodexInstructions(out), nil
 }
 

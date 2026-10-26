@@ -32,6 +32,9 @@ func (a *Auth) AuthKind() string {
 	if a == nil {
 		return ""
 	}
+	if IsCodexUseSIWC(a) {
+		return AuthKindOAuth
+	}
 	if kind := normalizeAuthKind(authAttribute(a, AttributeAuthKind)); kind != "" {
 		return kind
 	}
@@ -118,6 +121,12 @@ func authHasOAuthMetadata(auth *Auth) bool {
 		}
 	}
 	if token, ok := auth.Metadata["token"].(map[string]any); ok && len(token) > 0 {
+		return true
+	}
+	if siwc, ok := auth.Metadata["siwc"].(map[string]any); ok && len(siwc) > 0 {
+		return true
+	}
+	if sa, ok := auth.Metadata["service_account"].(map[string]any); ok && len(sa) > 0 {
 		return true
 	}
 	return false

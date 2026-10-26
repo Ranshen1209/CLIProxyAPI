@@ -462,41 +462,47 @@ func (s *GitTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
 
-	switch {
-	case auth.Storage != nil:
-		if auth.Metadata == nil {
-			auth.Metadata = make(map[string]any)
+	if handled, errCodex := cliproxyauth.PersistCodexAuthFile(ctx, path, auth); handled {
+		if errCodex != nil {
+			return "", errCodex
 		}
-		auth.Metadata["disabled"] = auth.Disabled
-		if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
-			setter.SetMetadata(auth.Metadata)
-		}
-		if err = auth.Storage.SaveTokenToFile(path); err != nil {
-			return "", err
-		}
-	case auth.Metadata != nil:
-		auth.Metadata["disabled"] = auth.Disabled
-		raw, errMarshal := json.Marshal(auth.Metadata)
-		if errMarshal != nil {
-			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
-		}
-		contentsMatch := false
-		if existing, errRead := os.ReadFile(path); errRead == nil {
-			contentsMatch = jsonEqual(existing, raw)
-		} else if !os.IsNotExist(errRead) {
-			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
-		}
-		if !contentsMatch {
-			tmp := path + ".tmp"
-			if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
-				return "", fmt.Errorf("auth filestore: write temp failed: %w", errWrite)
+	} else {
+		switch {
+		case auth.Storage != nil:
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
 			}
-			if errRename := os.Rename(tmp, path); errRename != nil {
-				return "", fmt.Errorf("auth filestore: rename failed: %w", errRename)
+			auth.Metadata["disabled"] = auth.Disabled
+			if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
+				setter.SetMetadata(auth.Metadata)
 			}
+			if err = auth.Storage.SaveTokenToFile(path); err != nil {
+				return "", err
+			}
+		case auth.Metadata != nil:
+			auth.Metadata["disabled"] = auth.Disabled
+			raw, errMarshal := json.Marshal(auth.Metadata)
+			if errMarshal != nil {
+				return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
+			}
+			contentsMatch := false
+			if existing, errRead := os.ReadFile(path); errRead == nil {
+				contentsMatch = jsonEqual(existing, raw)
+			} else if !os.IsNotExist(errRead) {
+				return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
+			}
+			if !contentsMatch {
+				tmp := path + ".tmp"
+				if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
+					return "", fmt.Errorf("auth filestore: write temp failed: %w", errWrite)
+				}
+				if errRename := os.Rename(tmp, path); errRename != nil {
+					return "", fmt.Errorf("auth filestore: rename failed: %w", errRename)
+				}
+			}
+		default:
+			return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 		}
-	default:
-		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 	}
 
 	if auth.Attributes == nil {
@@ -1546,7 +1552,12 @@ func rollbackRecoveredGitDirectory(gitDir, backupGitDir string) error {
 }
 
 func isRepositoryCorruptionError(err error) bool {
-	return errors.Is(err, dotgit.ErrPackfileNotFound) || errors.Is(err, plumbing.ErrObjectNotFound)
+	if errors.Is(err, dotgit.ErrPackfileNotFound) ||
+		errors.Is(err, dotgit.ErrIdxNotFound) ||
+		errors.Is(err, plumbing.ErrObjectNotFound) {
+		return true
+	}
+	return errors.Is(err, fs.ErrNotExist) && err != nil && strings.Contains(err.Error(), "packhandle:")
 }
 
 func verifyRepositoryHead(repo *git.Repository) error {

@@ -45,12 +45,16 @@ func TestMetadataConfigFieldsExposePluginSchema(t *testing.T) {
 		ConfigFields: []ConfigField{{
 			Name:        "mode",
 			Type:        ConfigFieldTypeEnum,
+			Default:     "safe",
 			EnumValues:  []string{"safe", "fast"},
 			Description: "Execution mode.",
 		}},
 	}
 	if meta.Logo == "" || len(meta.ConfigFields) != 1 {
 		t.Fatalf("metadata missing logo or config fields: %#v", meta)
+	}
+	if meta.ConfigFields[0].Default != "safe" {
+		t.Fatalf("config field default = %#v, want safe", meta.ConfigFields[0].Default)
 	}
 }
 
@@ -187,13 +191,15 @@ func TestHostModelTypesPreserveFields(t *testing.T) {
 		ForcedProvider: "gemini",
 		AuthID:         "exact-auth-123",
 		ProxyURL:       "socks5://127.0.0.1:1080",
+		Path:           "/v1/messages",
+		CallerScope:    "opaque-caller-scope-123",
 	}
 	rawRequest, errMarshalRequest := json.Marshal(request)
 	if errMarshalRequest != nil {
 		t.Fatalf("marshal HostModelExecutionRequest: %v", errMarshalRequest)
 	}
 	requestJSON := string(rawRequest)
-	for _, field := range []string{"entry_protocol", "exit_protocol", "model", "stream", "body", "headers", "query", "alt", "forced_provider", "auth_id", "proxy_url"} {
+	for _, field := range []string{"entry_protocol", "exit_protocol", "model", "stream", "body", "headers", "query", "alt", "forced_provider", "auth_id", "proxy_url", "path", "caller_scope"} {
 		if !strings.Contains(requestJSON, `"`+field+`"`) {
 			t.Fatalf("HostModelExecutionRequest JSON missing field %q: %s", field, requestJSON)
 		}
@@ -212,7 +218,9 @@ func TestHostModelTypesPreserveFields(t *testing.T) {
 		decodedRequest.Alt != request.Alt ||
 		decodedRequest.ForcedProvider != request.ForcedProvider ||
 		decodedRequest.AuthID != request.AuthID ||
-		decodedRequest.ProxyURL != request.ProxyURL {
+		decodedRequest.ProxyURL != request.ProxyURL ||
+		decodedRequest.Path != request.Path ||
+		decodedRequest.CallerScope != request.CallerScope {
 		t.Fatalf("HostModelExecutionRequest round trip = %#v", decodedRequest)
 	}
 	if got := decodedRequest.Headers.Values("X-Test"); len(got) != 2 || got[1] != "two" {
@@ -934,5 +942,54 @@ func TestQuotaBucketZeroRemainingFractionPreserved(t *testing.T) {
 	}
 	if bucket.RemainingFraction != 0 {
 		t.Fatalf("expected remainingFraction 0 to be preserved, got %f", bucket.RemainingFraction)
+	}
+}
+
+func TestHostAuthModelsTypes(t *testing.T) {
+	emptyReqData, errMarshalEmpty := json.Marshal(HostAuthModelsRequest{})
+	if errMarshalEmpty != nil {
+		t.Fatalf("marshal empty request: %v", errMarshalEmpty)
+	}
+	if string(emptyReqData) != "{}" {
+		t.Fatalf("marshaled empty request = %s, want {}", string(emptyReqData))
+	}
+
+	req := HostAuthModelsRequest{AuthIndex: "idx-codex-1"}
+	reqData, errMarshalReq := json.Marshal(req)
+	if errMarshalReq != nil {
+		t.Fatalf("marshal request: %v", errMarshalReq)
+	}
+	var decodedReq HostAuthModelsRequest
+	if errUnmarshalReq := json.Unmarshal(reqData, &decodedReq); errUnmarshalReq != nil {
+		t.Fatalf("unmarshal request: %v", errUnmarshalReq)
+	}
+	if decodedReq != req {
+		t.Fatalf("decoded request = %#v, want %#v", decodedReq, req)
+	}
+
+	resp := HostAuthModelsResponse{
+		Credentials: []HostAuthModels{
+			{
+				ID:        "codex-auth-1",
+				AuthIndex: "idx-codex-1",
+				Provider:  "codex",
+				Models:    []string{"codex/gpt-5.6-sol", "codex/gpt-6-astra"},
+			},
+		},
+	}
+	respData, errMarshalResp := json.Marshal(resp)
+	if errMarshalResp != nil {
+		t.Fatalf("marshal response: %v", errMarshalResp)
+	}
+	var decodedResp HostAuthModelsResponse
+	if errUnmarshalResp := json.Unmarshal(respData, &decodedResp); errUnmarshalResp != nil {
+		t.Fatalf("unmarshal response: %v", errUnmarshalResp)
+	}
+	if len(decodedResp.Credentials) != 1 ||
+		decodedResp.Credentials[0].ID != "codex-auth-1" ||
+		decodedResp.Credentials[0].AuthIndex != "idx-codex-1" ||
+		decodedResp.Credentials[0].Provider != "codex" ||
+		len(decodedResp.Credentials[0].Models) != 2 {
+		t.Fatalf("decoded response = %#v, want %#v", decodedResp, resp)
 	}
 }

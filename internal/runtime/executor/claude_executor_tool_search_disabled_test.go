@@ -39,10 +39,21 @@ const toolSearchExecutorGoldenPayload = `{"model":"claude-sonnet-4-5","input":[`
 
 var toolSearchExecutorGoldenCCH = regexp.MustCompile(`cch=[0-9a-f]+;`)
 
+// toolSearchExecutorGoldenDate is the calendar day the dev golden was recorded
+// on. OAuth cloaking injects a currentDate reminder, so the render pins the
+// executor clock to this day to keep the golden comparison date-independent.
+var toolSearchExecutorGoldenDate = time.Date(2026, time.October, 11, 12, 0, 0, 0, time.UTC)
+
 // renderToolSearchExecutorGolden captures the upstream bodies the Claude
 // executor sends for toolSearchExecutorGoldenPayload on every request path.
 func renderToolSearchExecutorGolden(t *testing.T) map[string]string {
 	t.Helper()
+	helps.ResetClaudeDiagnosticsForTest()
+	t.Cleanup(helps.ResetClaudeDiagnosticsForTest)
+	claudeCodeCurrentTimeFunc = func(*config.Config, *cliproxyauth.Auth) time.Time {
+		return toolSearchExecutorGoldenDate
+	}
+	t.Cleanup(func() { claudeCodeCurrentTimeFunc = nil })
 	payload := []byte(toolSearchExecutorGoldenPayload)
 	auths := map[string]map[string]string{
 		"official": {"api_key": "key-123", "cloak_mode": "never"},
@@ -109,8 +120,7 @@ func TestClaudeExecutor_ToolSearchDisabledMatchesDevGolden(t *testing.T) {
 		t.Fatalf("rendered %d bodies, golden has %d", len(got), len(want))
 	}
 	for name, body := range got {
-		expected := regexp.MustCompile(`Today's date is \d{4}-\d{2}-\d{2}`).ReplaceAllString(want[name], "Today's date is "+time.Now().Format("2006-01-02"))
-		if strings.ReplaceAll(body, "\r", "") != strings.ReplaceAll(expected, "\r", "") {
+		if strings.ReplaceAll(body, "\r", "") != strings.ReplaceAll(want[name], "\r", "") {
 			t.Errorf("%s differs from dev\n got: %s\nwant: %s", name, body, want[name])
 		}
 	}
